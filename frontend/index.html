@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CARDIO4Cities — City Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Only the weights the stylesheet actually sets. Fraunces is used at 600
+     for headings, Plex Mono at 400 for URLs and graph edges. -->
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F5F6F2;
+    --paper-raised:#FFFFFF;
+    --ink:#16231F;
+    --ink-soft:#4B5751;
+    --hairline:#D8DAD3;
+    --teal:#1F4D45;
+    --teal-soft:#E4ECE9;
+    --verified:#3C7A5E;
+    --verified-bg:#E7F1EA;
+    --single:#B98A2E;
+    --single-bg:#F6EDD9;
+    --conflicting:#B5592E;
+    --conflicting-bg:#F7E6DD;
+    --gap:#8C3A3A;
+    --gap-bg:#F3E1E1;
+    --denied:#7B8279;
+    --denied-bg:#EAEBE7;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--paper);color:var(--ink);
+    font-family:'IBM Plex Sans',sans-serif;font-size:15px;line-height:1.5;}
+  .shell{display:flex;min-height:100vh;}
+
+  /* ---------- Left rail: the pipeline itself ---------- */
+  .rail{width:300px;flex-shrink:0;background:var(--paper-raised);
+    border-right:1px solid var(--hairline);padding:28px 22px;
+    position:sticky;top:0;height:100vh;overflow-y:auto;}
+  .brand{font-family:'Fraunces',serif;font-weight:600;font-size:20px;
+    color:var(--teal);margin:0 0 2px 0;}
+  .brand-sub{font-size:12.5px;color:var(--ink-soft);margin:0 0 24px 0;}
+
+  .stage-list{list-style:none;margin:0;padding:0;position:relative;}
+  .stage{position:relative;padding:0 0 24px 30px;}
+  .stage::before{content:"";position:absolute;left:8px;top:20px;bottom:-6px;width:1px;
+    background:var(--hairline);}
+  .stage:last-child::before{display:none;}
+  .stage-dot{position:absolute;left:0;top:2px;width:17px;height:17px;
+    border-radius:50%;border:2px solid var(--hairline);background:var(--paper-raised);
+    transition:border-color .25s ease, background .25s ease;}
+  .stage.active .stage-dot{border-color:var(--teal);background:var(--teal);
+    box-shadow:0 0 0 4px var(--teal-soft);}
+  .stage.done .stage-dot{border-color:var(--verified);background:var(--verified);}
+  .stage-name{font-weight:500;font-size:14px;color:var(--ink);}
+  .stage.idle .stage-name{color:var(--ink-soft);}
+  .stage-detail{margin-top:4px;font-family:'IBM Plex Mono',monospace;
+    font-size:11.5px;color:var(--ink-soft);line-height:1.5;word-break:break-word;}
+  .stage-detail .row{margin:2px 0;}
+  .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10.5px;
+    margin:1px 4px 1px 0;}
+  .badge.v{background:var(--verified-bg);color:var(--verified);}
+  .badge.s{background:var(--single-bg);color:var(--single);}
+  .badge.c{background:var(--conflicting-bg);color:var(--conflicting);}
+  .badge.g{background:var(--gap-bg);color:var(--gap);}
+  .badge.d{background:var(--denied-bg);color:var(--denied);}
+
+  /* ---------- Main area ---------- */
+  .main{flex:1;padding:32px 44px;max-width:960px;}
+  .run-bar{display:flex;gap:10px;margin-bottom:12px;}
+  #countryInput{flex:0 0 180px;}
+  input[type=text]{flex:1;padding:11px 14px;border:1px solid var(--hairline);
+    border-radius:6px;font-size:14.5px;font-family:'IBM Plex Sans',sans-serif;
+    background:var(--paper-raised);color:var(--ink);}
+  input[type=text]:focus{outline:none;border-color:var(--teal);}
+  button{padding:11px 20px;border:none;border-radius:6px;background:var(--teal);
+    color:#fff;font-size:14.5px;font-weight:500;cursor:pointer;
+    font-family:'IBM Plex Sans',sans-serif;}
+  button:disabled{background:var(--hairline);color:var(--ink-soft);cursor:default;}
+  button.ghost{background:transparent;color:var(--teal);border:1px solid var(--teal);
+    padding:7px 13px;font-size:13px;}
+
+  .asset-bar{font-size:12.5px;color:var(--ink-soft);margin-bottom:22px;
+    display:flex;gap:7px;align-items:center;flex-wrap:wrap;min-height:22px;}
+  .chip{padding:3px 10px;border:1px solid var(--hairline);border-radius:12px;
+    background:var(--paper-raised);cursor:pointer;font-size:12.5px;color:var(--teal);}
+  .chip:hover{border-color:var(--teal);}
+
+  .notice{border-left:3px solid var(--single);background:var(--single-bg);
+    padding:9px 13px;border-radius:0 5px 5px 0;font-size:13px;margin-bottom:16px;}
+
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--hairline);margin-bottom:22px;}
+  .tab{padding:9px 16px;font-size:13.5px;color:var(--ink-soft);cursor:pointer;
+    border-bottom:2px solid transparent;}
+  .tab.active{color:var(--teal);border-bottom-color:var(--teal);font-weight:500;}
+  .panel{display:none;}
+  .panel.active{display:block;}
+
+  .empty{color:var(--ink-soft);font-size:14px;padding:26px 0;max-width:62ch;}
+  .panel-head{display:flex;justify-content:space-between;align-items:center;
+    gap:12px;margin-bottom:14px;}
+
+  /* report typography */
+  .report h1{font-family:'Fraunces',serif;font-weight:600;font-size:26px;
+    margin:0 0 4px 0;color:var(--teal);}
+  .report h2{font-size:16px;font-weight:600;margin:26px 0 6px 0;color:var(--ink);}
+  .report .subnote{font-size:12.5px;color:var(--ink-soft);margin:0 0 10px 0;font-style:italic;}
+  .report p{max-width:72ch;}
+  .fact-item{border-left:3px solid var(--hairline);padding:8px 0 8px 14px;margin-bottom:9px;}
+  .fact-item.verified{border-color:var(--verified);}
+  .fact-item.single{border-color:var(--single);}
+  .fact-item.conflicting{border-color:var(--conflicting);}
+  .fact-item.gap{border-color:var(--gap);}
+  .fact-text{font-size:14.5px;}
+  .fact-src{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--ink-soft);
+    margin-top:4px;word-break:break-word;}
+  .fact-src a{color:var(--teal);}
+
+  table{width:100%;border-collapse:collapse;font-size:13.5px;}
+  th{text-align:left;color:var(--ink-soft);font-weight:500;font-size:12px;
+    padding:6px 10px;border-bottom:1px solid var(--hairline);}
+  td{padding:8px 10px;border-bottom:1px solid var(--hairline);vertical-align:top;}
+  td.url{font-family:'IBM Plex Mono',monospace;font-size:11.5px;word-break:break-all;
+    max-width:300px;}
+  td.reason{font-size:12.5px;color:var(--ink-soft);max-width:280px;}
+
+  .pill{display:inline-block;padding:2px 9px;border-radius:12px;font-size:11.5px;font-weight:500;
+    white-space:nowrap;}
+  .pill.allowed{background:var(--verified-bg);color:var(--verified);}
+  .pill.denied{background:var(--denied-bg);color:var(--denied);}
+  .pill.verified{background:var(--verified-bg);color:var(--verified);}
+  .pill.single_source{background:var(--single-bg);color:var(--single);}
+  .pill.conflicting{background:var(--conflicting-bg);color:var(--conflicting);}
+  .pill.gap{background:var(--gap-bg);color:var(--gap);}
+
+  .ask-box{display:flex;gap:10px;margin-bottom:18px;}
+  .answer{border:1px solid var(--hairline);border-left:3px solid var(--teal);
+    border-radius:0 6px 6px 0;padding:14px 16px;background:var(--paper-raised);
+    font-size:14.5px;margin-bottom:16px;}
+  .cite-list{list-style:none;padding:0;margin:0;}
+  .cite-list li{font-size:12.5px;color:var(--ink-soft);padding:6px 0;
+    border-bottom:1px solid var(--hairline);}
+  .cite-list a{color:var(--teal);font-family:'IBM Plex Mono',monospace;font-size:11.5px;
+    word-break:break-all;}
+  .cite-n{display:inline-block;min-width:24px;font-weight:600;color:var(--ink);}
+
+  .graph-fact{border:1px solid var(--hairline);border-radius:6px;padding:11px 14px;
+    margin-bottom:9px;background:var(--paper-raised);}
+  .graph-fact .rel{font-family:'IBM Plex Mono',monospace;font-size:11px;
+    color:var(--teal);text-transform:uppercase;letter-spacing:.04em;}
+  .graph-fact .when{font-size:11.5px;color:var(--ink-soft);margin-top:5px;}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ LEFT RAIL: live pipeline ============ -->
+  <div class="rail">
+    <p class="brand">CARDIO4Cities</p>
+    <p class="brand-sub" id="brandSub">City Intelligence Pipeline</p>
+    <ul class="stage-list" id="stageList"></ul>
+  </div>
+
+  <!-- ============ MAIN ============ -->
+  <div class="main">
+    <div class="run-bar">
+      <input type="text" id="cityInput" placeholder="Enter any city, e.g. Pune">
+      <input type="text" id="countryInput" placeholder="Country (optional)">
+      <button id="runBtn" onclick="runResearch()">Run research</button>
+    </div>
+    <div class="asset-bar" id="assetBar"></div>
+
+    <div id="noticeArea"></div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="report" onclick="switchTab('report')">Report</div>
+      <div class="tab" data-tab="sources" onclick="switchTab('sources')">Sources</div>
+      <div class="tab" data-tab="graph" onclick="switchTab('graph')">Knowledge graph</div>
+      <div class="tab" data-tab="ask" onclick="switchTab('ask')">Ask</div>
+    </div>
+
+    <div class="panel active" id="panel-report">
+      <div class="empty">Enter a city and run research. The brief is built only from statements that passed independent fact-checking, each carrying the sources it came from; anything that could not be established is listed as a gap rather than filled in.</div>
+    </div>
+
+    <div class="panel" id="panel-sources">
+      <div class="empty">Every URL the pipeline considered, with the crawlability gate's verdict and its reason — including the sources it deliberately refused to read.</div>
+    </div>
+
+    <div class="panel" id="panel-graph">
+      <div class="ask-box">
+        <input type="text" id="graphInput" placeholder="Scope the graph traversal, e.g. who runs screening programmes">
+        <button onclick="loadGraph()">Search graph</button>
+      </div>
+      <div id="graphResults"><div class="empty">Relationships extracted into Neo4j by Graphiti, read back at query time. Each edge carries the validity window that makes the graph a record over time rather than a snapshot.</div></div>
+    </div>
+
+    <div class="panel" id="panel-ask">
+      <div class="ask-box">
+        <input type="text" id="askInput" placeholder="Ask a question about the researched city...">
+        <button onclick="askQuestion()">Ask</button>
+      </div>
+      <div id="askResults"><div class="empty">Answers are generated strictly from indexed passages and graph facts for this city, with inline citations. If the evidence does not answer the question, the system says so instead of guessing.</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Served by FastAPI in deployment, so the API is same-origin and relative
+// paths work. Falls back to a local uvicorn when the file is opened directly.
+const API_BASE = location.protocol.startsWith("http") ? "" : "http://localhost:8000";
+const API_LABEL = API_BASE || location.origin;
+
+const STAGES = [
+  {id:"planner", label:"Planner"},
+  {id:"query_gen", label:"Query generation"},
+  {id:"search", label:"Search / discovery"},
+  {id:"crawlability", label:"Crawlability gate"},
+  {id:"extraction", label:"Extraction"},
+  {id:"fact_check", label:"Fact-checking"},
+  {id:"graph_writer", label:"Persist (3 datastores)"},
+  {id:"coverage_evaluator", label:"Coverage check"},
+  {id:"report", label:"Report generation"},
+];
+
+let activeCity = "";
+
+function esc(s){
+  return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+// Applied to already-escaped text, so the only thing it can introduce is an
+// anchor around a URL.
+function linkify(escaped){
+  return escaped.replace(/(https?:\/\/[^\s,<)]+)/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+
+function renderStages(){
+  const list = document.getElementById("stageList");
+  list.innerHTML = "";
+  STAGES.forEach(s => {
+    const li = document.createElement("li");
+    li.className = "stage idle";
+    li.id = "stage-" + s.id;
+    li.innerHTML = `<div class="stage-dot"></div>
+                    <div class="stage-name">${s.label}</div>
+                    <div class="stage-detail" id="detail-${s.id}"></div>`;
+    list.appendChild(li);
+  });
+}
+renderStages();
+
+function switchTab(name){
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  document.getElementById("panel-" + name).classList.add("active");
+}
+
+function setDetail(id, html){
+  const el = document.getElementById("detail-" + id);
+  if(el) el.innerHTML = html;
+}
+
+// /research is a single blocking call, so stages move as a group rather than
+// one-by-one: all active while the request is in flight, all done on success.
+function setAllStages(state){
+  document.querySelectorAll(".stage").forEach(el => {
+    el.classList.remove("idle", "active", "done");
+    el.classList.add(state);
+  });
+}
+
+async function readError(resp){
+  let detail = "";
+  try{
+    const body = await resp.json();
+    detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+  }catch(_){ /* error body wasn't JSON */ }
+  return `Request failed (${resp.status} ${resp.statusText}). ${detail}`.trim();
+}
+
+function networkMessage(){
+  return `Could not reach the API at ${API_LABEL}. Check the server is running.`;
+}
+
+function showNotices(warnings){
+  const area = document.getElementById("noticeArea");
+  area.innerHTML = (warnings || []).map(w =>
+    `<div class="notice">${esc(w)}</div>`).join("");
+}
+
+// ---------------------------------------------------------------- run
+async function runResearch(){
+  const city = document.getElementById("cityInput").value.trim();
+  const country = document.getElementById("countryInput").value.trim();
+  if(!city) return;
+
+  const btn = document.getElementById("runBtn");
+  renderStages();
+  setAllStages("active");
+  showNotices([]);
+  btn.disabled = true;
+  document.getElementById("panel-report").innerHTML =
+    `<div class="empty">Researching ${esc(city)} across five dimensions. This is live internet research — search, a robots.txt and ToS check on every candidate, extraction, then independent fact-checking of each claim — so it takes a while, and the brief appears once every stage has finished.</div>`;
+
+  try{
+    const resp = await fetch(`${API_BASE}/research`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({city: city, country: country || null}),
+    });
+    if(!resp.ok) throw new Error(await readError(resp));
+
+    const data = await resp.json();
+    activeCity = data.city || city;
+    setAllStages("done");
+    renderRunDetail(data);
+    showNotices(data.warnings);
+    renderReport(data.report_markdown);
+    loadSources();
+    loadGraph();
+    loadCities();
+  }catch(e){
+    setAllStages("idle");
+    const msg = (e instanceof TypeError) ? networkMessage() : e.message;
+    document.getElementById("panel-report").innerHTML = `<div class="empty">${esc(msg)}</div>`;
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+// /research returns aggregate counts, not per-node events, so only the stages
+// those counts speak to get a detail line. The rest stay blank by design.
+function renderRunDetail(data){
+  const c = data.counts || {};
+  const covered = (data.covered_dimensions || []).length;
+  const total = (data.dimensions || []).length;
+
+  setDetail("planner", `<div class="row">${total} dimensions in scope</div>`);
+  setDetail("query_gen", `<div class="row">pass ${data.research_passes ?? 1} of the planner loop</div>`);
+  setDetail("search", `<div class="row">${c.candidates_considered ?? 0} candidate URLs considered</div>`);
+  setDetail("crawlability",
+    `<span class="badge v">${c.sources_allowed ?? 0} allowed</span>` +
+    `<span class="badge d">${c.sources_denied ?? 0} denied</span>`);
+  setDetail("extraction", `<div class="row">${c.sources_read ?? 0} sources read successfully</div>`);
+  setDetail("fact_check",
+    `<span class="badge v">${c.verified_facts ?? 0} verified</span>` +
+    `<span class="badge s">${c.single_source_facts ?? 0} single-source</span>` +
+    `<span class="badge c">${c.conflicting_facts ?? 0} conflicting</span>` +
+    `<span class="badge d">${c.unsupported_claims ?? 0} dropped</span>`);
+  setDetail("graph_writer", `<div class="row">relational + vector + graph written</div>`);
+  setDetail("coverage_evaluator",
+    `<div class="row">${covered} of ${total} dimensions covered</div>` +
+    `<span class="badge g">${c.gaps ?? 0} gaps logged</span>`);
+  setDetail("report", `<div class="row">brief generated and stored</div>`);
+}
+
+// ---------------------------------------------------------------- report
+function renderReport(markdown){
+  const dl = activeCity
+    ? `<button class="ghost" onclick="downloadReport()">Download brief (.md)</button>` : "";
+  document.getElementById("panel-report").innerHTML =
+    `<div class="panel-head"><div></div>${dl}</div>
+     <div class="report">${markdownToHtml(markdown)}</div>`;
+}
+
+function downloadReport(){
+  window.location = `${API_BASE}/report/${encodeURIComponent(activeCity)}/download`;
+}
+
+// Confidence tier travels with each fact as a [MARKER] prefix written by
+// report_agent.py, so it survives regrouping the report by dimension.
+const TIER_CLASSES = {
+  "VERIFIED": "verified",
+  "SINGLE SOURCE": "single",
+  "CONFLICTING": "conflicting",
+  "GAP": "gap",
+};
+
+// Minimal, purpose-built converter for the report_agent.py output format —
+// not a general markdown parser.
+function markdownToHtml(md){
+  if(!md) return '<div class="empty">No report generated.</div>';
+  let html = "";
+  let fact = null;  // buffered so its source/reasoning lines land inside it
+
+  const flush = () => {
+    if(!fact) return;
+    html += `<div class="${fact.cls}"><div class="fact-text">${fact.text}</div>${fact.extras.join("")}</div>`;
+    fact = null;
+  };
+  const bold = t => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+
+  for(const raw of md.split("\n")){
+    const trimmed = raw.trim();
+
+    if(trimmed.startsWith("# ")){ flush(); html += `<h1>${esc(trimmed.slice(2))}</h1>`; continue; }
+    if(trimmed.startsWith("## ")){ flush(); html += `<h2>${esc(trimmed.slice(3))}</h2>`; continue; }
+    if(trimmed.length > 1 && trimmed.startsWith("_") && trimmed.endsWith("_")){
+      flush();
+      html += `<p class="subnote">${esc(trimmed.slice(1, -1))}</p>`;
+      continue;
+    }
+    // A fact's provenance lines are sub-bullets, so they must be matched
+    // before the generic bullet rule below.
+    if(/^- \*\*[A-Za-z]+:\*\*/.test(trimmed)){
+      const detail = linkify(bold(esc(trimmed.slice(2))));
+      if(fact) fact.extras.push(`<div class="fact-src">${detail}</div>`);
+      else html += `<div class="fact-src">${detail}</div>`;
+      continue;
+    }
+    if(trimmed.startsWith("- ")){
+      flush();
+      let text = trimmed.slice(2);
+      let cls = "fact-item";
+      const marker = text.match(/^\[([A-Z ]+)\]\s*/);
+      if(marker){
+        const tierCls = TIER_CLASSES[marker[1]];
+        if(tierCls) cls += ` ${tierCls}`;
+        text = text.slice(marker[0].length);
+        const pill = marker[1].toLowerCase().replace(" ", "_");
+        fact = {cls, text: `<span class="pill ${pill}">${esc(marker[1])}</span> ${bold(esc(text))}`, extras: []};
+        continue;
+      }
+      fact = {cls, text: bold(esc(text)), extras: []};
+      continue;
+    }
+    if(trimmed === "") continue;
+    flush();
+    html += `<p>${bold(esc(trimmed))}</p>`;
+  }
+  flush();
+  return html;
+}
+
+// ---------------------------------------------------------------- sources
+async function loadSources(){
+  const panel = document.getElementById("panel-sources");
+  if(!activeCity){ return; }
+  panel.innerHTML = '<div class="empty">Loading source registry…</div>';
+  try{
+    const resp = await fetch(`${API_BASE}/sources/${encodeURIComponent(activeCity)}`);
+    if(!resp.ok){ panel.innerHTML = `<div class="empty">${esc(await readError(resp))}</div>`; return; }
+    const data = await resp.json();
+    const rows = (data.sources || []).map(s => `
+      <tr>
+        <td class="url">${linkify(esc(s.url))}</td>
+        <td>${esc(s.dimension || "")}</td>
+        <td><span class="pill ${s.verdict === "ALLOWED" ? "allowed" : "denied"}">${esc((s.verdict||"").toLowerCase())}</span></td>
+        <td class="reason">${esc(s.reason || "")}</td>
+      </tr>`).join("");
+    panel.innerHTML = `
+      <div class="panel-head"><div class="subnote">${data.count} URL(s) considered for ${esc(activeCity)}. Refused sources are kept on the record — that is how you can tell the gate ran.</div></div>
+      <table>
+        <thead><tr><th>URL</th><th>Dimension</th><th>Gate verdict</th><th>Reason</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }catch(e){
+    panel.innerHTML = `<div class="empty">${esc(networkMessage())}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------- graph
+async function loadGraph(){
+  const out = document.getElementById("graphResults");
+  if(!activeCity){
+    out.innerHTML = '<div class="empty">Run research on a city first — the graph is built from facts that passed fact-checking.</div>';
+    return;
+  }
+  const question = document.getElementById("graphInput").value.trim();
+  out.innerHTML = '<div class="empty">Querying the knowledge graph…</div>';
+  try{
+    const url = `${API_BASE}/graph/${encodeURIComponent(activeCity)}` +
+                (question ? `?question=${encodeURIComponent(question)}` : "");
+    const resp = await fetch(url);
+    if(!resp.ok){ out.innerHTML = `<div class="empty">${esc(await readError(resp))}</div>`; return; }
+    const data = await resp.json();
+    if(!(data.facts || []).length){
+      out.innerHTML = '<div class="empty">The graph returned no matching relationships for this city.</div>';
+      return;
+    }
+    out.innerHTML = data.facts.map(f => {
+      const when = f.invalid_at
+        ? `valid ${esc(f.valid_at || "?")} → superseded ${esc(f.invalid_at)}`
+        : `valid from ${esc(f.valid_at || f.recorded_at || "unknown")} · current`;
+      return `<div class="graph-fact">
+                ${f.relationship ? `<div class="rel">${esc(f.relationship)}</div>` : ""}
+                <div>${esc(f.fact)}</div>
+                <div class="when">${when}</div>
+              </div>`;
+    }).join("");
+  }catch(e){
+    out.innerHTML = `<div class="empty">${esc(networkMessage())}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------- ask
+async function askQuestion(){
+  const q = document.getElementById("askInput").value.trim();
+  const city = activeCity || document.getElementById("cityInput").value.trim();
+  const out = document.getElementById("askResults");
+
+  if(!q){ out.innerHTML = '<div class="empty">Type a question first.</div>'; return; }
+  if(!city){ out.innerHTML = '<div class="empty">Research a city first — answers are only ever drawn from what has been indexed for that city.</div>'; return; }
+
+  out.innerHTML = '<div class="empty">Searching the indexed evidence…</div>';
+  try{
+    const resp = await fetch(`${API_BASE}/ask`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({city: city, question: q}),
+    });
+    if(!resp.ok){ out.innerHTML = `<div class="empty">${esc(await readError(resp))}</div>`; return; }
+    const data = await resp.json();
+
+    const cites = (data.citations || []).map(c => {
+      const target = c.type === "graph_fact"
+        ? `knowledge graph${c.relationship ? " · " + esc(c.relationship) : ""}`
+        : linkify(esc(c.url || ""));
+      return `<li><span class="cite-n">[${c.n}]</span> ${target}</li>`;
+    }).join("");
+
+    out.innerHTML =
+      `<div class="answer">${esc(data.answer || "No answer returned.")}</div>` +
+      (cites ? `<div class="subnote">Evidence cited</div><ul class="cite-list">${cites}</ul>` : "") +
+      (data.degraded || []).map(d => `<div class="notice">${esc(d)}</div>`).join("");
+  }catch(e){
+    out.innerHTML = `<div class="empty">${esc(networkMessage())}</div>`;
+  }
+}
+
+// ------------------------------------------------- the reusable asset
+async function loadCities(){
+  const bar = document.getElementById("assetBar");
+  try{
+    const resp = await fetch(`${API_BASE}/cities`);
+    if(!resp.ok) throw new Error();
+    const data = await resp.json();
+    if(!(data.cities || []).length){
+      bar.innerHTML = "<span>No cities researched yet.</span>";
+      return;
+    }
+    bar.innerHTML = "<span>Already researched:</span>" + data.cities.map(c =>
+      `<span class="chip" onclick="openCity('${encodeURIComponent(c.city)}')">${esc(c.city)}</span>`
+    ).join("");
+  }catch(e){
+    bar.innerHTML = "";
+  }
+}
+
+// Re-opening a stored brief is the point of the intelligence asset: the
+// second person to ask about a city should not have to pay for the research
+// again.
+async function openCity(encoded){
+  const city = decodeURIComponent(encoded);
+  try{
+    const resp = await fetch(`${API_BASE}/report/${encodeURIComponent(city)}`);
+    if(!resp.ok) return;
+    const data = await resp.json();
+    activeCity = data.city;
+    document.getElementById("cityInput").value = data.city;
+    setAllStages("done");
+    showNotices([`Showing the stored brief for ${data.city}, generated ${data.generated_at || "earlier"} in ${data.run_mode} mode. Run research again to refresh it.`]);
+    renderReport(data.markdown);
+    switchTab("report");
+    loadSources();
+    loadGraph();
+  }catch(e){ /* leave the current view alone */ }
+}
+
+async function checkHealth(){
+  const sub = document.getElementById("brandSub");
+  try{
+    const resp = await fetch(`${API_BASE}/health`);
+    if(!resp.ok) throw new Error();
+    const data = await resp.json();
+    sub.textContent = `API ${data.status} · run mode ${data.run_mode}`;
+  }catch(e){
+    sub.textContent = `API unreachable at ${API_LABEL}`;
+  }
+}
+
+document.getElementById("askInput").addEventListener("keydown", e => { if(e.key === "Enter") askQuestion(); });
+document.getElementById("graphInput").addEventListener("keydown", e => { if(e.key === "Enter") loadGraph(); });
+document.getElementById("cityInput").addEventListener("keydown", e => { if(e.key === "Enter") runResearch(); });
+
+checkHealth();
+loadCities();
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+# Demo deployment: one container, one volume.
+#
+# Neo4j is deliberately NOT a service here — the case study mandates the
+# Neo4j Graph Database Sandbox (https://sandbox.neo4j.com), which is hosted
+# by Neo4j. Create one, then put its Bolt URI and password in .env.
+#
+# Milvus defaults to Lite (embedded, a file under ./data), which is what
+# makes this fit on a small VM. To run a real Milvus standalone cluster
+# instead, layer the opt-in override on top — it adds etcd, MinIO and milvus
+# and repoints MILVUS_URI for you:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.milvus.yml up -d --build
+
+services:
+  app:
+    build: .
+    image: cardio4cities:latest
+    container_name: cardio4cities
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RUN_MODE: ${RUN_MODE:-LIVE}
+      DATABASE_URL: sqlite:///./data/cardio4cities.db
+      MILVUS_URI: ${MILVUS_URI:-./data/milvus.db}
+    ports:
+      - "80:8000"
+    volumes:
+      - app-data:/app/data
+
+volumes:
+  app-data:

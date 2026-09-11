@@ -1,0 +1,30 @@
+# --- Orchestration ---
+langgraph==0.2.60
+langchain-core==0.3.28
+
+# --- Web / App ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+
+# --- Search + crawling ---
+duckduckgo-search==7.2.0     # zero-key search for MOCK/dev; swap for tavily-python in prod
+tavily-python==0.5.0          # optional, used when TAVILY_API_KEY is set
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# --- Datastores ---
+sqlalchemy==2.0.36            # relational store (SQLite by default, Postgres via DATABASE_URL)
+pymilvus==2.4.10              # vector store
+sentence-transformers==3.3.1  # local embeddings (no external API needed)
+neo4j==5.27.0                  # graph driver
+graphiti-core==0.7.3           # temporal knowledge graph layer over Neo4j
+
+# --- LLM ---
+openai==1.64.0
+
+# --- Testing ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
