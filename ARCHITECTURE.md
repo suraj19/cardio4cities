@@ -299,6 +299,19 @@ There is deliberately **no automatic fallback to `RUN_MODE=MOCK`**. Serving
 canned data that looks like research would be a worse failure than an honest
 empty report.
 
+**The cost of this design, learned the hard way.** Swallowing an exception into
+a warning is right for a transient outage and wrong for a programming error,
+and the graph write path could not tell them apart. A missing required
+argument to Graphiti's `add_episode` raised `TypeError` on every write, was
+downgraded to "Graph store unavailable", and presented as an empty knowledge
+graph rather than as a bug — while the warning text sent the reader off to
+check the Neo4j Sandbox. Two consequences now baked in: the warning branches
+on exception class so an API mismatch says so, and `graphiti-core` is pinned
+exactly, because that pin is load-bearing rather than hygiene. The general
+lesson is that graceful degradation needs to distinguish *"the world is
+broken"* from *"this code is wrong"*, or it will hide the second one
+indefinitely.
+
 ## How this is evaluated
 
 Three layers, of which two exist.

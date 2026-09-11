@@ -23,6 +23,7 @@ Sandbox connection. LIVE mode requires a real Neo4j Sandbox URI.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from app.config import settings
@@ -33,6 +34,23 @@ from app.stores.lazy import LazyStore
 def _iso(value) -> str | None:
     """Graphiti returns datetimes; the API returns JSON."""
     return value.isoformat() if isinstance(value, datetime) else (value or None)
+
+
+def _silence_neo4j_notifications() -> None:
+    """Stop the driver logging a WARNING per unknown property key per query.
+
+    Graphiti's edge search selects `episodes`, `fact_embedding` and
+    `reference_time`. Neo4j raises notification 01N52 for any property key
+    missing from the database's token store, and reading a missing property
+    in Cypher yields null rather than an error — so these are advisory. But
+    the driver logs one per property per query, which reads like a failure.
+
+    `reference_time` is not an EntityEdge field at all; Graphiti selects it
+    defensively, so it warns forever no matter what the graph contains.
+    Scoped to the notifications sub-logger, so real driver errors still
+    surface.
+    """
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
 
 class _MockGraphStore:
@@ -157,6 +175,7 @@ class _GraphitiGraphStore:
         from graphiti_core import Graphiti
         from graphiti_core.llm_client.config import LLMConfig
         from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+        from graphiti_core.nodes import EpisodeType
 
         if not settings.LLM_API_KEY:
             raise ValueError(
@@ -169,14 +188,24 @@ class _GraphitiGraphStore:
                 "instance at https://sandbox.neo4j.com and copy its Bolt URI."
             )
 
-        # OpenAIGenericClient rather than OpenAIClient: it injects the JSON
-        # schema into the prompt instead of relying on OpenAI's native
-        # structured-output API, which most compatible providers don't implement.
+        _silence_neo4j_notifications()
+
+        # temperature=0 is set explicitly because Graphiti's default is 1,
+        # which is the wrong setting for entity extraction — re-reading the
+        # same passage should yield the same entities, not creative ones.
+        #
+        # max_tokens is deliberately generous for the same reason our own
+        # client keeps LLM_REASONING_EFFORT low: Gemini 3 always thinks,
+        # thinking tokens come out of the output budget, and Graphiti's
+        # extraction prompts are long. Graphiti exposes no reasoning_effort
+        # knob, so headroom is the only lever available on this path.
         llm_config = LLMConfig(
             api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,
             small_model=settings.LLM_SMALL_MODEL,
             base_url=settings.LLM_BASE_URL,
+            temperature=0,
+            max_tokens=settings.GRAPHITI_MAX_TOKENS,
         )
         embedder, cross_encoder = _build_local_clients()
 
@@ -184,10 +213,21 @@ class _GraphitiGraphStore:
             uri=settings.NEO4J_URI,
             user=settings.NEO4J_USER,
             password=settings.NEO4J_PASSWORD,
-            llm_client=OpenAIGenericClient(config=llm_config),
+            llm_client=OpenAIGenericClient(
+                config=llm_config,
+                # Graphiti defaults to native json_schema constrained decoding,
+                # which the OpenAI-compatible shims for Gemini, DeepSeek and
+                # Groq implement inconsistently. json_object puts the schema in
+                # the prompt instead: slightly weaker adherence, but it is the
+                # only mode that works across every provider we document.
+                structured_output_mode="json_object",
+                max_tokens=settings.GRAPHITI_MAX_TOKENS,
+            ),
             embedder=embedder,
             cross_encoder=cross_encoder,
         )
+        # Episodes are plain prose, not chat transcripts or JSON.
+        self._episode_type = EpisodeType.text
         self._indices_ready = False
 
     async def _ensure_indices(self):
@@ -208,6 +248,8 @@ class _GraphitiGraphStore:
             name=f"city_anchor_{city}",
             episode_body=f"{city} is a city participating in the CARDIO4Cities programme.",
             source_description="system_bootstrap",
+            reference_time=datetime.now(timezone.utc),
+            source=self._episode_type,
         )
 
     async def add_programme_fact(
@@ -229,10 +271,16 @@ class _GraphitiGraphStore:
             f"[dimension={dimension}; confidence_tier={tier}; claim_id={claim_id}; "
             f"sources={' ; '.join(source_urls) if source_urls else 'none'}]"
         )
+        # reference_time is what makes this a temporal graph rather than a
+        # plain one: it is the instant the extracted edges are valid as of,
+        # and it is what a later contradicting fact gets compared against to
+        # set the earlier edge's invalid_at. It is required, with no default.
         await self.graphiti.add_episode(
             name=f"fact_{claim_id}",
             episode_body=episode_body,
             source_description=f"fact_check_agent/{dimension}",
+            reference_time=datetime.now(timezone.utc),
+            source=self._episode_type,
         )
 
     async def query_facts_for_city(

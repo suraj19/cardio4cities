@@ -23,6 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -68,6 +69,11 @@ def _clean_city(city: str) -> str:
     if not city:
         raise HTTPException(status_code=400, detail="City must not be empty.")
     return city[:120]
+
+app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
+@app.get("/")
+async def read_index():
+    return FileResponse("frontend/index.html")
 
 
 @app.get("/health")

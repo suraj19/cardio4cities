@@ -38,7 +38,7 @@ class Settings:
     # strongest JSON adherence of the cheap models, which is what Graphiti's
     # entity extraction depends on. Alternatives are listed in .env.example.
     LLM_API_KEY: str = _env("LLM_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
-    LLM_MODEL: str = _env("LLM_MODEL", default="gemini-3.5-flash")
+    LLM_MODEL: str = _env("LLM_MODEL", default="gemini 1.5 Flash")
     LLM_BASE_URL: str = _env(
         "LLM_BASE_URL",
         default="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -53,6 +53,13 @@ class Settings:
     # Clear LLM_REASONING_EFFORT for providers that reject the parameter.
     LLM_REASONING_EFFORT: str = _env("LLM_REASONING_EFFORT", default="low")
     LLM_MAX_TOKENS: int = int(_env("LLM_MAX_TOKENS", default="4096"))
+
+    # Graphiti's own budget, separate and much larger. Its entity-extraction
+    # prompts are long, it asks for bigger JSON than we do, and it has no
+    # reasoning_effort knob — so on a thinking model, headroom is the only
+    # defence against an empty response. Too low here shows up as a graph
+    # with no edges rather than as an error.
+    GRAPHITI_MAX_TOKENS: int = int(_env("GRAPHITI_MAX_TOKENS", default="16384"))
 
     # --- Embeddings: local, no API key, shared by Milvus and Graphiti --
     EMBEDDING_MODEL: str = _env("EMBEDDING_MODEL", default="all-MiniLM-L6-v2")

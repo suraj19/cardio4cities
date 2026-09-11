@@ -63,8 +63,17 @@ def check_neo4j() -> bool:
         try:
             driver.verify_connectivity()
             with driver.session(database="neo4j") as session:
-                count = session.run("MATCH (n) RETURN count(n) AS count").single()["count"]
-            return _report("Neo4j", True, f"{settings.NEO4J_URI} reachable, {count} node(s)")
+                nodes = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+                # Edge count, not node count, is the number that matters. A
+                # graph with entities but zero RELATES_TO edges holds no facts,
+                # and that is the shape a silently failing write leaves behind.
+                edges = session.run(
+                    "MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS c"
+                ).single()["c"]
+            detail = f"{settings.NEO4J_URI} reachable, {nodes} node(s), {edges} fact edge(s)"
+            if nodes and not edges:
+                detail += " — entities exist but no facts; check the run warnings"
+            return _report("Neo4j", True, detail)
         finally:
             driver.close()
     except Exception as exc:

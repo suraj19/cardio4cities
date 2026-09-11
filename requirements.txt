@@ -5,7 +5,7 @@ langchain-core==0.3.28
 # --- Web / App ---
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.4
+pydantic==2.11.9             # floor set by graphiti-core (>=2.11.5)
 python-dotenv==1.0.1
 
 # --- Search + crawling ---
@@ -19,11 +19,11 @@ lxml==5.3.0
 sqlalchemy==2.0.36            # relational store (SQLite by default, Postgres via DATABASE_URL)
 pymilvus==2.4.10              # vector store
 sentence-transformers==3.3.1  # local embeddings (no external API needed)
-neo4j==5.27.0                  # graph driver
-graphiti-core==0.7.3           # temporal knowledge graph layer over Neo4j
+neo4j==5.27.0                  # graph driver (graphiti-core needs >=5.26.0)
+graphiti-core==0.30.2          # temporal knowledge graph layer over Neo4j
 
 # --- LLM ---
-openai==1.64.0
+openai==1.109.1                # highest 1.x; graphiti-core needs >=1.91.0
 
 # --- Testing ---
 pytest==8.3.4

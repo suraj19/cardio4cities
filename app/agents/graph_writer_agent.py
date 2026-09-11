@@ -87,10 +87,20 @@ async def graph_writer_node(state: CityResearchState) -> dict:
                 claim_id=fc.claim_id,
             )
     except Exception as exc:
+        # The hint has to depend on the exception class. A TypeError here is a
+        # Graphiti API mismatch, not an outage, and pointing the reader at the
+        # Sandbox in that case sends them to debug the wrong system entirely.
+        if isinstance(exc, (TypeError, AttributeError, ImportError)):
+            hint = (
+                "This is an API mismatch, not an outage — check the installed "
+                "graphiti-core against the version in requirements.txt."
+            )
+        else:
+            hint = "Check the Neo4j Sandbox has not expired."
         warnings.append(
             f"Graph store unavailable ({type(exc).__name__}: {exc}) — facts are "
             f"still in the relational audit trail, but graph exploration is "
-            f"unavailable for this run. Check the Neo4j Sandbox has not expired."
+            f"unavailable for this run. {hint}"
         )
 
     return {

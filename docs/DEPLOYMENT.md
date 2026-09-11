@@ -195,6 +195,24 @@ Graphiti's indices and constraints are built automatically on the first write
 (`_ensure_indices` in [`app/stores/graph_store.py`](../app/stores/graph_store.py)),
 so a blank Sandbox needs no manual setup.
 
+**Verify facts actually landed**, because index creation succeeding and facts
+being written are independent — the first creates property keys even with zero
+data, which makes an empty graph look partly populated:
+
+```cypher
+MATCH ()-[e:RELATES_TO]->() RETURN count(e) AS fact_edges;
+MATCH (n:Entity) RETURN count(n) AS entities;
+```
+
+`fact_edges` is the number that matters; `count(n)` can be non-zero with no
+facts in the graph at all. `scripts/check_services.py` reports both.
+
+> `graphiti-core` is pinned exactly (`==0.30.2`) and the pin is **load-bearing**,
+> not hygiene. Its `LLMConfig` and `add_episode` signatures have both changed
+> incompatibly across minor versions, and because graph writes degrade to a
+> warning rather than an error, a mismatch presents as a silently empty graph
+> rather than a stack trace. Do not float this dependency.
+
 ### 3.5 LLM provider
 
 Any OpenAI-compatible chat endpoint. Only chat completions are used — no
@@ -331,6 +349,9 @@ of degraded modes is in
 | Research completes but the brief is nearly all Gaps | LLM returning empty or malformed output | Check `LLM_API_KEY`; raise `LLM_MAX_TOKENS`; confirm `LLM_REASONING_EFFORT=low` |
 | Brief warns *"Query planning fell back to keyword templates"* | The LLM was unreachable on that pass | Working as designed — the run continued on generic searches. Check the provider and the key |
 | Brief is entirely Gaps citing *"Search returned no candidate sources"* | No outbound internet, or the search provider is blocked | Check egress from the VM; confirm `TAVILY_API_KEY` if set |
+| Brief has facts, but `/graph/{city}` and the Knowledge graph tab are empty | Graph writes failed and were downgraded to a warning | Read the Run Warnings. `TypeError`/`AttributeError` means a `graphiti-core` version mismatch; anything else is the Sandbox |
+| Neo4j logs *"property key does not exist"* for `episodes` / `fact_embedding` | Advisory only, but it means **no fact edges exist** — those keys only appear once an edge is written | Run `check_services`; if nodes > 0 and fact edges = 0, the writes are failing. `reference_time` warns permanently and can be ignored |
+| `check_services` shows nodes but **0 fact edges** | Entity extraction returned nothing, or writes failed | Raise `GRAPHITI_MAX_TOKENS`; a thinking model can spend the whole budget reasoning and return empty |
 | Run is very slow, logs show retries | Provider rate limiting | Lower `LLM_MAX_CONCURRENCY` to 2–3 |
 | `ModuleNotFoundError: milvus_lite` | Native Windows | Run in Docker or WSL2, or point `MILVUS_URI` at a server |
 | First request hangs ~60s | Embedding model loading | Expected once per container start; the healthcheck's 40s start period covers it |
