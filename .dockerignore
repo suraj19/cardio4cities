@@ -1,0 +1,27 @@
+.git
+.gitignore
+.idea
+.vscode
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+
+# Secrets and local state. `data` is a runtime volume, not image content —
+# baking a dev SQLite file into the image would ship stale research.
+.env
+data
+*.db
+*.sqlite3
+
+# Repo furniture: nothing below is COPYed by the Dockerfile, so excluding it
+# just keeps the build context small and the layer cache stable.
+tests
+pytest.ini
+docs
+examples
+*.md
+.env.example
+docker-compose*.yml
