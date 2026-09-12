@@ -9,7 +9,10 @@ pydantic==2.11.9             # floor set by graphiti-core (>=2.11.5)
 python-dotenv==1.0.1
 
 # --- Search + crawling ---
-duckduckgo-search==7.2.0     # zero-key search for MOCK/dev; swap for tavily-python in prod
+ddgs==9.14.4                  # zero-key search. Renamed from `duckduckgo-search`,
+                              # whose old import now fails rather than warning.
+                              # Also multi-backend, so one engine blocking us
+                              # no longer means zero results.
 tavily-python==0.5.0          # optional, used when TAVILY_API_KEY is set
 requests==2.32.3
 beautifulsoup4==4.12.3

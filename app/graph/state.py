@@ -55,13 +55,18 @@ class CityResearchState(TypedDict, total=False):
     covered_dimensions: list[str]
     uncovered_dimensions: list[str]
 
-    # --- write idempotency ---
+    # --- work idempotency ---
     # The persistence node runs once per pass over state that accumulates, so
     # without these it would re-write everything an earlier pass already
     # stored: duplicate audit rows, duplicate graph episodes, re-embedded
     # passages.
     persisted_claim_ids: Annotated[list[str], append_list]
     indexed_urls: Annotated[list[str], append_list]
+    # Every URL extraction has tried, successful or not. `passages` records
+    # only the successes, so without this a URL that failed to fetch is
+    # retried by every remaining pass — paying for the same failure repeatedly
+    # and repeating its warning in the brief.
+    attempted_urls: Annotated[list[str], append_list]
 
     # --- final output ---
     report_markdown: str

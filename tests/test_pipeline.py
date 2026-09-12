@@ -212,6 +212,136 @@ def test_malformed_verdict_fails_safe(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Token cost: fact-checking dominates it, so claims share a context
+# ---------------------------------------------------------------------
+def _fc_claim(n: int, domain: str = "a.example.org") -> Claim:
+    return Claim(
+        claim_id=f"c-{n}",
+        text=f"The city runs screening programme number {n}.",
+        source_url=f"https://{domain}/{n}",
+        source_domain=domain,
+        is_city_level=True,
+        dimension="healthcare_programmes",
+    )
+
+
+def _recording_checker(monkeypatch, responses: list[str]) -> list[str]:
+    """Patch the checker's LLM to return `responses` in order, recording prompts."""
+    from app.agents import fact_check_agent
+
+    prompts: list[str] = []
+
+    def fake_complete(system, user, **kwargs):
+        prompts.append(user)
+        return responses[min(len(prompts) - 1, len(responses) - 1)]
+
+    monkeypatch.setattr(fact_check_agent.llm_client, "complete", fake_complete)
+    return prompts
+
+
+def test_same_domain_claims_are_adjudicated_in_one_call(monkeypatch):
+    """The whole point of the batch: three claims from one source used to cost
+    three copies of the same corroboration context and system prompt."""
+    from app.agents import fact_check_agent
+
+    prompts = _recording_checker(
+        monkeypatch,
+        [
+            '[{"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "a"},'
+            ' {"claim": "C2", "tier": "SINGLE_SOURCE", "reasoning": "b"},'
+            ' {"claim": "C3", "tier": "SINGLE_SOURCE", "reasoning": "c"}]'
+        ],
+    )
+
+    result = fact_check_agent.fact_check_node(
+        {"claims": [_fc_claim(n) for n in (1, 2, 3)], "passages": []}
+    )
+
+    assert len(prompts) == 1, f"expected one batched call, made {len(prompts)}"
+    assert len(result["fact_checked"]) == 3
+    assert {f.claim_id for f in result["fact_checked"]} == {"c-1", "c-2", "c-3"}
+
+
+def test_claims_from_different_domains_are_not_batched_together(monkeypatch):
+    """Grouping is only sound per origin domain, because the corroboration pool
+    excludes the claim's own domain. Mixing domains would either leak a
+    claim's own source back to it as evidence, or withhold a valid one."""
+    from app.agents import fact_check_agent
+
+    prompts = _recording_checker(
+        monkeypatch, ['[{"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "a"}]']
+    )
+
+    fact_check_agent.fact_check_node(
+        {
+            "claims": [_fc_claim(1, "a.example.org"), _fc_claim(2, "b.example.org")],
+            "passages": [],
+        }
+    )
+
+    assert len(prompts) == 2
+
+
+def test_verdicts_are_matched_by_label_not_by_position(monkeypatch):
+    """A model that answers out of order must not shift every verdict onto the
+    wrong claim — that would attach one claim's sources to another."""
+    from app.agents import fact_check_agent
+
+    _recording_checker(
+        monkeypatch,
+        [
+            '[{"claim": "C2", "tier": "CONFLICTING", "reasoning": "second"},'
+            ' {"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "first"}]'
+        ],
+    )
+
+    result = fact_check_agent.fact_check_node(
+        {"claims": [_fc_claim(1), _fc_claim(2)], "passages": []}
+    )
+    tiers = {f.claim_id: f.tier for f in result["fact_checked"]}
+
+    assert tiers["c-1"] == ConfidenceTier.SINGLE_SOURCE
+    assert tiers["c-2"] == ConfidenceTier.CONFLICTING
+
+
+def test_a_claim_the_batch_omitted_is_re_asked_on_its_own(monkeypatch):
+    """Batching is an optimisation, so it must never cost a claim its verdict."""
+    from app.agents import fact_check_agent
+
+    prompts = _recording_checker(
+        monkeypatch,
+        [
+            # C2 is simply missing from the batch response.
+            '[{"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "a"}]',
+            '{"tier": "CONFLICTING", "reasoning": "asked alone"}',
+        ],
+    )
+
+    result = fact_check_agent.fact_check_node(
+        {"claims": [_fc_claim(1), _fc_claim(2)], "passages": []}
+    )
+    tiers = {f.claim_id: f.tier for f in result["fact_checked"]}
+
+    assert len(prompts) == 2, "the omitted claim should have been re-asked"
+    assert tiers["c-1"] == ConfidenceTier.SINGLE_SOURCE
+    assert tiers["c-2"] == ConfidenceTier.CONFLICTING
+
+
+def test_context_window_is_chosen_for_relevance_not_taken_from_the_head():
+    """Head-truncation costs the same tokens and routinely cut away the one
+    sentence that could settle the claim."""
+    from app.agents.fact_check_agent import _relevant_window, _tokens
+
+    needle = "The municipal hypertension screening programme covered 36 lakh residents."
+    text = ("unrelated boilerplate navigation text. " * 60) + needle
+
+    window = _relevant_window(text, _tokens(needle), 200)
+
+    assert "hypertension screening programme" in window
+    assert len(window) == 200, "the budget must be spent, not shrunk"
+
+
+# ---------------------------------------------------------------------
 # Non-negotiable #5 — the graph is readable at query time
 # ---------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -251,6 +381,149 @@ async def test_nodes_skip_already_processed_items_on_a_second_pass():
     assert again["claims"] == []
 
 
+def test_a_url_that_failed_to_fetch_is_not_retried_next_pass():
+    """A failed fetch produces no passage, so `passages` alone cannot tell a
+    later pass that the URL was already tried. Without `attempted_urls`, every
+    remaining pass re-fetches every dead link and repeats its warning."""
+    from app.agents.extraction_agent import extraction_node
+    from app.models.schemas import CrawlabilityResult, CrawlVerdict, SourceCandidate
+
+    url = "https://example.org/unreadable"
+    state = {
+        "city": "Testopolis",
+        "candidates": [
+            SourceCandidate(url=url, title="t", snippet="s", dimension="cv_burden")
+        ],
+        "crawl_results": [
+            CrawlabilityResult(url=url, verdict=CrawlVerdict.ALLOWED, reason="test")
+        ],
+        "passages": [],
+        "attempted_urls": [url],
+    }
+
+    result = extraction_node(state)
+
+    assert result["passages"] == []
+    assert result["claims"] == []
+    assert not result.get("warnings"), (
+        "The URL was already attempted, so this pass should not have fetched "
+        "it again — nor warned about it a second time."
+    )
+
+
+def test_missing_html_parser_is_named_once_not_per_source(monkeypatch):
+    """A missing dependency is an environment fault, not a property of any
+    source. Reported per-source it becomes one indistinguishable warning per
+    candidate, which reads like a web outage and never names the cause."""
+    import app.agents.extraction_agent as extraction
+    from app.models.schemas import CrawlabilityResult, CrawlVerdict, SourceCandidate
+
+    monkeypatch.setattr(extraction.settings, "RUN_MODE", "LIVE")
+    monkeypatch.setattr(extraction, "_missing_parser_dependency", lambda: "beautifulsoup4")
+
+    urls = [f"https://example.org/{n}" for n in range(5)]
+    state = {
+        "city": "Testopolis",
+        "candidates": [
+            SourceCandidate(url=u, title="t", snippet="s", dimension="cv_burden")
+            for u in urls
+        ],
+        "crawl_results": [
+            CrawlabilityResult(url=u, verdict=CrawlVerdict.ALLOWED, reason="test")
+            for u in urls
+        ],
+        "passages": [],
+    }
+
+    result = extraction.extraction_node(state)
+
+    assert len(result["warnings"]) == 1, (
+        f"Five sources produced {len(result['warnings'])} warnings; a missing "
+        "package should be stated once."
+    )
+    warning = result["warnings"][0]
+    assert "beautifulsoup4" in warning
+    assert "pip install" in warning, "The warning must say how to fix it."
+    assert result["passages"] == []
+
+
+# ---------------------------------------------------------------------
+# Fetching: what we agree to read, and with which parser
+# ---------------------------------------------------------------------
+_FEED = (
+    "<?xml version='1.0'?><rss version='2.0'><channel>"
+    "<item><title>City launches hypertension screening drive</title>"
+    "<description>The municipal health department will screen adults for "
+    "raised blood pressure at every primary health centre in the city during "
+    "the coming quarter, and will refer confirmed cases to district hospitals "
+    "for treatment and follow-up monitoring.</description></item>"
+    "</channel></rss>"
+)
+
+
+def _fetch_with(monkeypatch, body: str, content_type: str) -> str:
+    import requests
+
+    from app.agents.extraction_agent import _real_fetch
+
+    class _Response:
+        text = body
+        headers = {"Content-Type": content_type}
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _Response())
+    return _real_fetch("https://example.org/doc")
+
+
+def test_xml_is_parsed_as_xml_not_as_html(monkeypatch):
+    """bs4 warns when markup is parsed in the wrong mode, and it was right to:
+    text/xml slipped through the old substring content-type check and went to
+    the HTML parser."""
+    import warnings
+
+    from bs4 import XMLParsedAsHTMLWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        text = _fetch_with(monkeypatch, _FEED, "text/xml; charset=utf-8")
+
+    assert "hypertension screening" in text
+    assert not [w for w in caught if issubclass(w.category, XMLParsedAsHTMLWarning)], (
+        "the document was still parsed in HTML mode"
+    )
+
+
+def test_equivalent_xml_content_types_are_treated_alike(monkeypatch):
+    """The same feed used to be read or refused depending on which of two
+    interchangeable content types the server chose to send."""
+    as_text_xml = _fetch_with(monkeypatch, _FEED, "text/xml")
+    as_rss = _fetch_with(monkeypatch, _FEED, "application/rss+xml")
+
+    assert as_text_xml == as_rss
+    assert as_text_xml
+
+
+def test_csv_is_refused_rather_than_read_as_a_page(monkeypatch):
+    """"text" in content_type accepted text/csv and text/javascript, which an
+    HTML parser turns into a plausible-looking blob of prose that then reaches
+    the model as though it were a page."""
+    rows = "indicator,year,value\n" + "\n".join(
+        f"bp_prevalence,{year},28.{year % 10}" for year in range(1990, 2030)
+    )
+
+    with pytest.raises(ValueError, match="unsupported content type"):
+        _fetch_with(monkeypatch, rows, "text/csv")
+
+
+def test_a_page_with_no_readable_text_is_dropped_before_the_model_call(monkeypatch):
+    """Extraction costs one model call per source, so an empty page would buy
+    an empty answer at full price."""
+    with pytest.raises(ValueError, match="readable text"):
+        _fetch_with(monkeypatch, "<html><body><p>Hi</p></body></html>", "text/html")
+
+
 # ---------------------------------------------------------------------
 # Offline resilience: no internet at all
 # ---------------------------------------------------------------------
@@ -264,6 +537,7 @@ async def test_total_outage_still_produces_an_honest_report(monkeypatch):
     call to get far enough to report anything at all.
     """
     from app.agents import search_agent
+    from app.config import settings as cfg
     from app.llm.client import llm_client
 
     def _unreachable(*args, **kwargs):
@@ -271,7 +545,14 @@ async def test_total_outage_still_produces_an_honest_report(monkeypatch):
 
     # One patch covers every agent: they all import the same client singleton.
     monkeypatch.setattr(llm_client, "complete", _unreachable)
-    monkeypatch.setattr(search_agent, "_run_query", lambda query, city: [])
+    # (results, warning) — no warning, because this simulates search working
+    # and legitimately finding nothing, not search being broken.
+    monkeypatch.setattr(search_agent, "_run_query", lambda query, city: ([], None))
+    # The official statistics APIs are a separate dependency from the model,
+    # so they have to be turned off explicitly for this to be a *total*
+    # outage rather than a partial one. That they survive an LLM-only outage
+    # is the point of the next test.
+    monkeypatch.setattr(cfg, "ENABLE_OFFICIAL_DATA", False)
 
     state = await workflow.ainvoke(
         {"city": "Darkville", "retry_count": 0}, config=WORKFLOW_CONFIG
@@ -300,3 +581,370 @@ async def test_total_outage_still_produces_an_honest_report(monkeypatch):
     # The degradation is disclosed, not hidden.
     assert any("fell back to keyword templates" in w for w in state["warnings"])
     assert "## Run Warnings" in report
+
+
+# ---------------------------------------------------------------------
+# Vector store: a stale collection must be detected, not upserted into
+# ---------------------------------------------------------------------
+class _FakeMilvus:
+    """Just enough MilvusClient to exercise the schema check offline."""
+
+    def __init__(self, described):
+        self._described = described
+
+    def describe_collection(self, collection_name):
+        if isinstance(self._described, Exception):
+            raise self._described
+        return self._described
+
+
+def _store_with_schema(described, dimension=384):
+    """A _MilvusVectorStore with its schema check wired to a fake, bypassing
+    __init__ so no Milvus server or pymilvus connection is needed."""
+    from app.stores import vector_store as vs
+
+    store = object.__new__(vs._MilvusVectorStore)
+    store.collection_name = "city_passages"
+    store.dimension = dimension
+    store.client = _FakeMilvus(described)
+    return store
+
+
+def _schema(primary_type="VARCHAR", dim=384, vector_field="vector"):
+    return {
+        "fields": [
+            {"name": "id", "type": primary_type, "is_primary": True},
+            {"name": vector_field, "type": "FloatVector", "params": {"dim": dim}},
+        ]
+    }
+
+
+def test_int64_primary_key_is_detected_as_unusable():
+    """The exact production failure: a collection left over from an earlier
+    build has an Int64 primary key, so every upsert of a URL-hash id dies with
+    DataNotMatchException. has_collection() cannot see this, which is why the
+    broken state used to survive every restart.
+    """
+    problem = _store_with_schema(_schema(primary_type="Int64"))._schema_problem()
+
+    assert problem, "An Int64 primary key was not flagged."
+    assert "INT64" in problem
+    assert "VARCHAR" in problem
+
+
+def test_matching_schema_is_left_alone():
+    """The important negative case — dropping is destructive."""
+    assert _store_with_schema(_schema())._schema_problem() is None
+
+
+def test_embedding_dimension_change_is_detected():
+    problem = _store_with_schema(_schema(dim=768), dimension=384)._schema_problem()
+    assert problem and "768" in problem and "384" in problem
+
+
+def test_missing_vector_field_is_detected():
+    problem = _store_with_schema(_schema(vector_field="embedding"))._schema_problem()
+    assert problem and "vector" in problem
+
+
+def test_unreadable_schema_fails_open():
+    """If the schema cannot be read, assume it is fine. A false positive here
+    deletes working data on a guess; a false negative only lets the upsert
+    error surface, which is recoverable."""
+    store = _store_with_schema(RuntimeError("connection reset"))
+    assert store._schema_problem() is None
+
+
+# ---------------------------------------------------------------------
+# Discovery failures are reported, not swallowed
+# ---------------------------------------------------------------------
+def _force_live_ddg(monkeypatch):
+    """Take the node out of MOCK mode and off Tavily, so the DuckDuckGo branch
+    is the one under test. `is_mock` is derived from RUN_MODE, so setting
+    RUN_MODE is enough."""
+    from app.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "RUN_MODE", "LIVE")
+    monkeypatch.setattr(cfg, "TAVILY_API_KEY", "")
+
+
+def test_search_provider_failure_is_reported_not_swallowed(monkeypatch):
+    """A broken search provider must not be indistinguishable from a city
+    nobody has written about.
+
+    Regression guard for a real bug: `_run_query` returned a bare empty list
+    on any exception, so a renamed dependency or a rate limit produced exactly
+    the same output as a genuine absence of sources — and the cause appeared
+    in no warning, no report and nowhere else either.
+    """
+    from app.agents import search_agent
+    from app.models.schemas import PlannedQuery
+
+    _force_live_ddg(monkeypatch)
+
+    def _renamed_package(query):
+        raise ImportError("No DuckDuckGo client is installed.")
+
+    monkeypatch.setattr(search_agent, "_duckduckgo_search", _renamed_package)
+
+    results, warning = search_agent._run_query(
+        PlannedQuery(text="pune hypertension prevalence", dimension="cv_burden"), "Pune"
+    )
+
+    assert results == []
+    assert warning, "A provider exception produced no warning at all."
+    assert "DuckDuckGo search failed" in warning
+    # The exception type has to survive into the warning, because that is what
+    # tells an operator whether to reinstall a package or wait out a limit.
+    assert "ImportError" in warning
+
+
+def test_total_search_failure_is_stated_once_and_unambiguously(monkeypatch):
+    """Identical provider errors collapse to one warning, plus a summary that
+    distinguishes "not established" from "nothing to find"."""
+    from app.agents import search_agent
+    from app.models.schemas import PlannedQuery
+
+    _force_live_ddg(monkeypatch)
+
+    def _rate_limited(query):
+        raise RuntimeError("Ratelimit")
+
+    monkeypatch.setattr(search_agent, "_duckduckgo_search", _rate_limited)
+
+    queries = [
+        PlannedQuery(text=f"pune query {i}", dimension="cv_burden") for i in range(4)
+    ]
+    result = search_agent.search_node({"city": "Pune", "planned_queries": queries})
+
+    assert result["candidates"] == []
+
+    warnings = result["warnings"]
+    # Four identical failures, so: one deduplicated provider error and one
+    # total-failure summary. Not four, and not zero.
+    assert len(warnings) == 2, warnings
+    assert sum("Ratelimit" in w for w in warnings) == 1
+    assert "not established" in warnings[-1]
+    assert "Pune" in warnings[-1]
+
+
+# ---------------------------------------------------------------------
+# Official statistics: structured APIs alongside web discovery
+# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_official_statistics_survive_an_llm_outage(monkeypatch):
+    """With search and the model both dead, the two API-backed dimensions
+    still produce real facts.
+
+    This is the whole reason the official-data path exists as a separate
+    source type: nothing in it needs a language model, because a field is
+    read out of JSON rather than extracted from prose. So an outage that
+    empties the web path leaves cv_burden and health_system intact, and only
+    the other three dimensions become gaps.
+    """
+    from app.agents import search_agent
+    from app.agents.official_data_agent import DIMENSIONS_SERVED
+    from app.llm.client import llm_client
+
+    def _unreachable(*args, **kwargs):
+        raise ConnectionError("Network is unreachable")
+
+    monkeypatch.setattr(llm_client, "complete", _unreachable)
+    monkeypatch.setattr(search_agent, "_run_query", lambda query, city: ([], None))
+
+    state = await workflow.ainvoke(
+        {"city": "Dimapur", "country": "India", "retry_count": 0}, config=WORKFLOW_CONFIG
+    )
+
+    official = state["fact_checked"]
+    assert official, "The official-data path produced nothing without the LLM."
+    assert {f.dimension for f in official} == DIMENSIONS_SERVED
+    assert sorted(state["covered_dimensions"]) == sorted(DIMENSIONS_SERVED)
+
+    # The remaining dimensions are gaps, not filler.
+    assert set(state["uncovered_dimensions"]) == set(DIMENSIONS) - DIMENSIONS_SERVED
+    assert {g.dimension for g in state["gaps"]} == set(DIMENSIONS) - DIMENSIONS_SERVED
+
+
+@pytest.mark.asyncio
+async def test_official_statistics_are_flagged_as_national_not_city():
+    """Country-level data in a city brief has to read as country-level data.
+
+    These APIs publish by country, so presenting their numbers as findings
+    about the city would be the exact failure the national_vs_city_flag
+    exists to prevent — and it would be invisible to a reader.
+    """
+    from app.agents.official_data_agent import DIMENSIONS_SERVED
+
+    state = await workflow.ainvoke(
+        {"city": "Pune", "country": "India", "retry_count": 0}, config=WORKFLOW_CONFIG
+    )
+
+    official = [f for f in state["fact_checked"] if f.dimension in DIMENSIONS_SERVED
+                and f.source_url.startswith(("https://ghoapi", "https://api.worldbank"))]
+    assert official, "No official-API facts in the run."
+
+    for fact in official:
+        assert fact.national_vs_city_flag is True, (
+            f"{fact.claim_id} is country-level data presented without a flag."
+        )
+        assert fact.source_url, "An official fact reached the report with no source."
+        # The reasoning must disclose that no model adjudicated this, so the
+        # two provenance paths are distinguishable in the audit trail.
+        assert "not sent for LLM adjudication" in fact.reasoning
+
+    report = state["report_markdown"]
+    assert "national/regional data, not confirmed city-specific" in report
+
+
+@pytest.mark.asyncio
+async def test_official_data_does_not_duplicate_on_a_second_pass():
+    """Claim ids are deterministic, so a retry pass must recognise its own
+    earlier work and emit nothing."""
+    from app.agents.official_data_agent import official_data_node
+
+    state = await workflow.ainvoke(
+        {"city": "Pune", "country": "India", "retry_count": 0}, config=WORKFLOW_CONFIG
+    )
+    again = official_data_node(state)
+
+    assert again.get("fact_checked", []) == []
+    assert again.get("passages", []) == []
+
+
+@pytest.mark.asyncio
+async def test_official_data_can_be_turned_off(monkeypatch):
+    """The web-only path stays demoable, and stays the thing the
+    crawlability gate is judged on."""
+    from app.config import settings as cfg
+    from app.agents.official_data_agent import DIMENSIONS_SERVED
+
+    monkeypatch.setattr(cfg, "ENABLE_OFFICIAL_DATA", False)
+    state = await workflow.ainvoke(
+        {"city": "Pune", "country": "India", "retry_count": 0}, config=WORKFLOW_CONFIG
+    )
+
+    assert not any(
+        f.source_url.startswith(("https://ghoapi", "https://api.worldbank"))
+        for f in state["fact_checked"]
+    )
+    # And the dimensions are still covered, by the web path, so the toggle
+    # changes provenance rather than silently shrinking the brief.
+    assert DIMENSIONS_SERVED <= set(state["covered_dimensions"])
+
+
+# ---------------------------------------------------------------------
+# Provider portability: the run is metered per second, not per day
+# ---------------------------------------------------------------------
+class _RecordingCompletions:
+    def __init__(self):
+        self.kwargs = None
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+
+        class _Msg:
+            content = "[]"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Response:
+            choices = [_Choice()]
+
+        return _Response()
+
+
+def _patched_client(monkeypatch):
+    """An LLMClient wired to a recording stub, in LIVE mode."""
+    from app.llm.client import LLMClient
+
+    recorder = _RecordingCompletions()
+
+    class _Chat:
+        completions = recorder
+
+    class _Fake:
+        chat = _Chat()
+
+    client = LLMClient()
+    monkeypatch.setattr(client, "_get_client", lambda: _Fake())
+    monkeypatch.setattr("app.llm.client.settings.RUN_MODE", "LIVE")
+    return client, recorder
+
+
+def test_reasoning_effort_is_omitted_when_unset(monkeypatch):
+    """An OpenAI-compatible shim that does not implement `reasoning_effort`
+    rejects the request outright rather than ignoring the field, so sending it
+    to a non-thinking provider fails 100% of calls. Empty must mean absent,
+    not present-and-empty."""
+    client, recorder = _patched_client(monkeypatch)
+    monkeypatch.setattr("app.llm.client.settings.LLM_REASONING_EFFORT", "")
+
+    client.complete("sys", "user")
+
+    assert "reasoning_effort" not in recorder.kwargs
+
+
+def test_reasoning_effort_is_sent_when_configured(monkeypatch):
+    """The complement: on a thinking model the cap must actually be applied,
+    or a long extraction prompt reasons until the budget is gone and returns
+    an empty string."""
+    client, recorder = _patched_client(monkeypatch)
+    monkeypatch.setattr("app.llm.client.settings.LLM_REASONING_EFFORT", "low")
+
+    client.complete("sys", "user")
+
+    assert recorder.kwargs["reasoning_effort"] == "low"
+
+
+def test_recursion_limit_covers_every_pass_the_retry_budget_allows():
+    """A limit too low fails as GraphRecursionError several minutes into a run,
+    after the research has been paid for. It is derived from the node table so
+    that adding a node cannot silently shorten the last pass."""
+    from app.config import settings as cfg
+    from app.graph.workflow import NODES, NODES_PER_PASS, WORKFLOW_CONFIG
+
+    assert NODES_PER_PASS == len(NODES) - 1  # report runs once, at the end
+    needed = NODES_PER_PASS * (cfg.MAX_PLANNER_RETRIES + 1) + 1
+    assert WORKFLOW_CONFIG["recursion_limit"] >= needed
+
+
+def test_blank_numeric_settings_fall_back_instead_of_crashing(monkeypatch):
+    """Commenting a line out and blanking it are the two obvious ways to say
+    "use the default" in a .env file, and `int(os.getenv(...))` only honoured
+    the first — the second raised ValueError at import, with a traceback
+    pointing at config.py rather than at the edit."""
+    from app.config import _int_env
+
+    monkeypatch.setenv("C4C_TEST_NUMBER", "")
+    assert _int_env("C4C_TEST_NUMBER", 7) == 7
+
+    monkeypatch.setenv("C4C_TEST_NUMBER", "   ")
+    assert _int_env("C4C_TEST_NUMBER", 7) == 7
+
+    monkeypatch.setenv("C4C_TEST_NUMBER", "not-a-number")
+    assert _int_env("C4C_TEST_NUMBER", 7) == 7
+
+    monkeypatch.setenv("C4C_TEST_NUMBER", " 12 ")
+    assert _int_env("C4C_TEST_NUMBER", 7) == 12
+
+
+def test_graphiti_internal_concurrency_is_bounded():
+    """Graphiti reads SEMAPHORE_LIMIT once at its own module scope and defaults
+    to 20 concurrent extraction calls. It is the largest consumer of calls in a
+    run, so on a provider metered per second that default puts the retry storm
+    in the worst possible place. Importing our graph store must have bounded it
+    before graphiti_core could be imported."""
+    import os
+
+    import app.stores.graph_store  # noqa: F401  (import is the thing under test)
+    from app.config import settings as cfg
+
+    assert "SEMAPHORE_LIMIT" in os.environ, (
+        "Graphiti's concurrency was never bounded; it will default to 20."
+    )
+    # Equality rather than an inequality: the export uses setdefault, so a
+    # value that disagrees means either the export did not run or something
+    # set SEMAPHORE_LIMIT directly, and both are worth knowing about.
+    assert os.environ["SEMAPHORE_LIMIT"] == str(cfg.GRAPHITI_SEMAPHORE_LIMIT)

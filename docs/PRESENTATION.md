@@ -63,11 +63,11 @@ Lead's judgement. The honest machine contribution is the gap log.
 
 ## 3 · The agentic workflow
 
-LangGraph, nine nodes, one conditional edge.
+LangGraph, ten nodes, one conditional edge.
 
 ```
-planner → query_gen → search → crawlability → extraction
-                                                   ↓
+planner → query_gen → search → official_data → crawlability → extraction
+                                                                   ↓
                         report ← coverage ← graph_writer ← fact_check
                                     ↑ insufficient: re-plan the empty dimensions
                                       (bounded by MAX_PLANNER_RETRIES)

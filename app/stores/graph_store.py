@@ -24,11 +24,25 @@ Sandbox connection. LIVE mode requires a real Neo4j Sandbox URI.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from app.config import settings
 from app.llm import embeddings
 from app.stores.lazy import LazyStore
+
+# Bound Graphiti's internal LLM fan-out. It reads SEMAPHORE_LIMIT once, at its
+# own module scope, and defaults to 20 concurrent extraction calls — so this
+# has to be set before the first `import graphiti_core` anywhere in the
+# process. Every graphiti import in this codebase is deliberately lazy (inside
+# the functions below) and this module is their only importer, which is what
+# makes a module-level assignment here sufficient and reliable.
+#
+# Without it, the provider's rate limit is hit by the component that makes the
+# most calls, and Graphiti's retries surface as "Retrying
+# _generate_response_with_retry after N attempts" rather than as anything that
+# names a quota.
+os.environ.setdefault("SEMAPHORE_LIMIT", str(settings.GRAPHITI_SEMAPHORE_LIMIT))
 
 
 def _iso(value) -> str | None:
@@ -194,11 +208,11 @@ class _GraphitiGraphStore:
         # which is the wrong setting for entity extraction — re-reading the
         # same passage should yield the same entities, not creative ones.
         #
-        # max_tokens is deliberately generous for the same reason our own
-        # client keeps LLM_REASONING_EFFORT low: Gemini 3 always thinks,
-        # thinking tokens come out of the output budget, and Graphiti's
-        # extraction prompts are long. Graphiti exposes no reasoning_effort
-        # knob, so headroom is the only lever available on this path.
+        # max_tokens is deliberately generous because Graphiti's extraction
+        # prompts are long, it asks for bigger JSON than we do, and it exposes
+        # no reasoning_effort knob — so on a thinking model (Gemini 3,
+        # o-series) headroom is the only lever available on this path. Too low
+        # here shows up as a graph with no edges rather than as an error.
         llm_config = LLMConfig(
             api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,

@@ -17,10 +17,33 @@ the point of mock mode is to validate ORCHESTRATION, not recall quality.
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from app.config import settings
 from app.llm import embeddings
 from app.stores.lazy import LazyStore
+
+logger = logging.getLogger(__name__)
+
+
+def _type_name(field: dict) -> str:
+    """A field's data type as an uppercase name.
+
+    Resolved rather than compared directly, because `describe_collection`
+    reports this as a `DataType` enum in some pymilvus versions and as the
+    raw integer in others. An identity check against `DataType.VARCHAR`
+    silently fails on the integer form, which for the caller below would mean
+    deciding a perfectly good collection was broken.
+    """
+    raw = field.get("type")
+    try:
+        from pymilvus import DataType
+
+        if isinstance(raw, DataType):
+            return raw.name
+        return DataType(raw).name
+    except Exception:
+        return str(raw).upper()
 
 
 class _MockVectorStore:
@@ -62,20 +85,93 @@ class _MilvusVectorStore:
             uri=settings.MILVUS_URI,
             token=settings.MILVUS_TOKEN or None,
         )
+        self._ensure_collection()
 
-        if not self.client.has_collection(collection_name=self.collection_name):
-            # Quick-setup defaults would give an Int64 primary key and a vector
-            # field called "vector"; passages are keyed by URL hash instead, so
-            # the id type and field name are both set explicitly here.
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                dimension=self.dimension,
-                metric_type="COSINE",
-                id_type="string",
-                max_length=64,
-                auto_id=False,
-                vector_field_name="vector",
+    def _ensure_collection(self) -> None:
+        """Create the collection, or replace one whose schema cannot be written to.
+
+        `has_collection()` answers "does this name exist", which is not the
+        question that matters. A collection left behind by an earlier build can
+        exist with an **Int64** primary key, and then every upsert fails with
+        `DataNotMatchException: {id} field should be a int64` — because passage
+        ids are URL hashes. Checking only the name made that state permanent:
+        no amount of restarting fixed it, because the create call was skipped
+        every time.
+
+        Repairing it by dropping and recreating is safe here in a way it would
+        not be for the relational store. This collection is a derived index
+        over passages the pipeline re-fetches, not a system of record. The cost
+        is `/ask` recall for cities already researched, until they are
+        researched again.
+        """
+        if self.client.has_collection(collection_name=self.collection_name):
+            problem = self._schema_problem()
+            if problem is None:
+                return
+            logger.warning(
+                "Milvus collection %r is unusable: %s. Dropping and recreating "
+                "it. Passage embeddings for previously researched cities are "
+                "lost and will be rebuilt the next time those cities are run.",
+                self.collection_name,
+                problem,
             )
+            self.client.drop_collection(collection_name=self.collection_name)
+
+        # Quick-setup defaults would give an Int64 primary key and a vector
+        # field called "vector"; passages are keyed by URL hash instead, so
+        # the id type and field name are both set explicitly here.
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            dimension=self.dimension,
+            metric_type="COSINE",
+            id_type="string",
+            max_length=64,
+            auto_id=False,
+            vector_field_name="vector",
+        )
+
+    def _schema_problem(self) -> str | None:
+        """Why the existing collection is unusable, or None if it is fine.
+
+        Every check fails *open*: anything this cannot positively identify as
+        wrong is reported as fine. Dropping a collection is destructive, so a
+        false positive here would delete working data on a guess, whereas a
+        false negative merely lets the original upsert error surface — loudly,
+        and with a schema hint now attached to it.
+        """
+        try:
+            described = self.client.describe_collection(
+                collection_name=self.collection_name
+            )
+        except Exception:
+            return None
+
+        fields = described.get("fields") or []
+
+        primary = next((f for f in fields if f.get("is_primary")), None)
+        if primary is not None:
+            primary_type = _type_name(primary)
+            if primary_type in ("INT64", "INT32", "INT16", "INT8"):
+                return (
+                    f"its primary key {primary.get('name')!r} is {primary_type}, "
+                    f"but passage ids are URL hashes and need VARCHAR"
+                )
+
+        vector = next((f for f in fields if f.get("name") == "vector"), None)
+        if vector is None:
+            names = [f.get("name") for f in fields]
+            return f"it has no 'vector' field (fields present: {names})"
+
+        try:
+            dim = int((vector.get("params") or {}).get("dim"))
+        except (TypeError, ValueError):
+            return None
+        if dim != self.dimension:
+            return (
+                f"its vectors are {dim}-dimensional, but "
+                f"{settings.EMBEDDING_MODEL} produces {self.dimension}"
+            )
+        return None
 
     @staticmethod
     def _passage_id(url: str) -> str:

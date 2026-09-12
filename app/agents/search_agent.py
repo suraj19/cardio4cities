@@ -5,8 +5,13 @@ Turns planned queries into candidate URLs + snippets. This is DISCOVERY
 only — no page content is fetched here. That happens later, and only for
 URLs that clear the crawlability gate.
 
-Provider priority: Tavily (if key set) -> duckduckgo-search (no key needed)
--> MOCK canned results (no internet needed at all).
+Provider priority: Tavily (if key set) -> ddgs (no key needed) -> MOCK canned
+results (no internet needed at all).
+
+A failing provider costs the query it hit and no more, but it is *reported*.
+That is not cosmetic: discovery is the one stage whose failure is otherwise
+indistinguishable from a genuine absence of information, because a run with
+no candidates and a run about an undocumented city produce the same gaps.
 
 Two forms of pruning happen here rather than downstream, because every
 surviving URL costs a robots.txt fetch, a page fetch and an LLM call:
@@ -75,22 +80,51 @@ def _mock_search(query: PlannedQuery, city: str) -> list[SourceCandidate]:
     ]
 
 
-def _duckduckgo_search(query: PlannedQuery) -> list[SourceCandidate]:
-    from duckduckgo_search import DDGS
+def _ddgs_class():
+    """Resolve the DDGS class across the package rename.
 
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query.text, max_results=5):
-            results.append(
-                SourceCandidate(
-                    url=r.get("href", ""),
-                    title=r.get("title", ""),
-                    snippet=r.get("body", ""),
-                    query_used=query.text,
-                    dimension=query.dimension,
-                )
-            )
-    return results
+    `duckduckgo-search` was renamed to `ddgs`, and recent releases of the old
+    name raise on import rather than merely warning. Trying the new name first
+    means a fresh install gets the maintained package, while an existing
+    virtualenv holding the old one keeps working instead of silently
+    returning no search results.
+    """
+    try:
+        from ddgs import DDGS
+
+        return DDGS
+    except ImportError:
+        pass
+    try:
+        from duckduckgo_search import DDGS  # legacy name, pre-rename
+
+        return DDGS
+    except ImportError as exc:
+        raise ImportError(
+            "No DuckDuckGo client is installed. Run `pip install -U ddgs` — "
+            "the `duckduckgo-search` package was renamed to `ddgs`."
+        ) from exc
+
+
+def _duckduckgo_search(query: PlannedQuery) -> list[SourceCandidate]:
+    # Deliberately not used as a context manager. `ddgs.DDGS` does not
+    # implement that protocol, and `with` on it raises an AttributeError that
+    # would reach the caller's handler looking exactly like a search outage.
+    client = _ddgs_class()(timeout=settings.HTTP_TIMEOUT_SECONDS)
+    return [
+        SourceCandidate(
+            url=r.get("href", ""),
+            title=r.get("title", ""),
+            snippet=r.get("body", ""),
+            query_used=query.text,
+            dimension=query.dimension,
+        )
+        # `text()` returns title/href/body under exactly those keys in both
+        # the legacy package and `ddgs`, so this parsing is version-agnostic.
+        # Only arguments both versions accept are passed, which is what keeps
+        # the fallback import above usable.
+        for r in client.text(query.text, max_results=5)
+    ]
 
 
 def _tavily_search(query: PlannedQuery) -> list[SourceCandidate]:
@@ -110,18 +144,29 @@ def _tavily_search(query: PlannedQuery) -> list[SourceCandidate]:
     ]
 
 
-def _run_query(query: PlannedQuery, city: str) -> list[SourceCandidate]:
+def _run_query(query: PlannedQuery, city: str) -> tuple[list[SourceCandidate], str | None]:
+    """Returns the candidates and, if the provider failed, a warning to record.
+
+    The warning is the whole point of this signature. This function used to
+    swallow the exception and return an empty list, which made a broken search
+    provider indistinguishable from a city nobody has written about: the only
+    symptom was the coverage evaluator's *"Search returned no candidate
+    sources"*, and the actual cause — a rate limit, a renamed dependency, no
+    egress — appeared nowhere at all. A provider failure still costs only the
+    query it hit, but now it says so out loud.
+    """
     if settings.is_mock:
-        return _mock_search(query, city)
+        return _mock_search(query, city), None
+
+    provider = "Tavily" if settings.TAVILY_API_KEY else "DuckDuckGo"
     try:
         if settings.TAVILY_API_KEY:
-            return _tavily_search(query)
-        return _duckduckgo_search(query)
-    except Exception:
-        # A provider outage or rate limit on one query should cost that query,
-        # not the run. The dimension it served will surface as a gap if no
-        # other query covers it.
-        return []
+            return _tavily_search(query), None
+        return _duckduckgo_search(query), None
+    except Exception as exc:
+        # Keyed on the error rather than on the query text, so that ten queries
+        # failing the same way collapse into one warning instead of ten.
+        return [], f"{provider} search failed ({type(exc).__name__}: {exc})."
 
 
 def search_node(state: CityResearchState) -> dict:
@@ -131,9 +176,13 @@ def search_node(state: CityResearchState) -> dict:
     seen_urls = {c.url for c in state.get("candidates", [])}
     per_dimension: dict[str, int] = {}
     deduped: list[SourceCandidate] = []
+    failures: list[str] = []
 
     for query in queries:
-        for candidate in _run_query(query, city):
+        results, warning = _run_query(query, city)
+        if warning:
+            failures.append(warning)
+        for candidate in results:
             if not candidate.url or candidate.url in seen_urls:
                 continue
             if per_dimension.get(candidate.dimension, 0) >= settings.MAX_SOURCES_PER_DIMENSION:
@@ -142,4 +191,18 @@ def search_node(state: CityResearchState) -> dict:
             per_dimension[candidate.dimension] = per_dimension.get(candidate.dimension, 0) + 1
             deduped.append(candidate)
 
-    return {"candidates": deduped}
+    # dict.fromkeys collapses the repeats while preserving order.
+    warnings = list(dict.fromkeys(failures))
+    if queries and len(failures) == len(queries):
+        # Total discovery failure needs saying separately, because the gaps it
+        # produces are otherwise worded as though the research was done and
+        # found nothing. That distinction is the difference between "we do not
+        # know" and "there is nothing to know".
+        warnings.append(
+            f"All {len(queries)} search queries failed this pass, so no sources "
+            f"could be discovered. This is a search provider or dependency "
+            f"problem, not an absence of information about {city} — the gaps "
+            f"below mean 'not established', not 'nothing to find'."
+        )
+
+    return {"candidates": deduped, "warnings": warnings}

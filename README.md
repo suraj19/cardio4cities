@@ -80,7 +80,7 @@ curl -X POST http://localhost:8000/research \
 1. Set `RUN_MODE=LIVE` in `.env` (this is the default).
 2. Add `LLM_API_KEY`, plus the `LLM_BASE_URL` / `LLM_MODEL` pair for your
    provider (see the table below).
-3. Add `TAVILY_API_KEY`. Optional — search falls back to `duckduckgo-search`
+3. Add `TAVILY_API_KEY`. Optional — search falls back to `ddgs`
    with no key, but results are noticeably noisier.
 4. Create a **Neo4j Sandbox** at [sandbox.neo4j.com](https://sandbox.neo4j.com),
    open its *Connection details* tab, and copy the Bolt URL and password into
@@ -111,23 +111,44 @@ The LLM is configured by endpoint, not by vendor — anything speaking the OpenA
 chat-completions protocol works, selected entirely by `LLM_BASE_URL` and
 `LLM_MODEL`:
 
-| Provider | `LLM_BASE_URL` | `LLM_MODEL` | Notes |
-|---|---|---|---|
-| **Google Gemini** (default) | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.5-flash` | Best JSON adherence, which is what Graphiti's entity extraction depends on. Key from [AI Studio](https://aistudio.google.com/apikey). |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash` | Cheapest. `deepseek-chat` was retired 2026-07-24. |
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | Fastest. Avoid small models; they break structured extraction. |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` | Paid, most reliable. |
+Pick on **throughput, not capability**. One city costs 150–250 calls and
+400–600k tokens — about 80 of ours, plus Graphiti's entity extraction, which
+runs several calls per fact and is usually the larger half. Free tiers meter
+that either per second or per day, and the difference decides whether a run
+finishes: a per-second limit just makes a batch job slower, a per-day cap stops
+it until tomorrow.
 
-Two Gemini-specific notes. Avoid `gemini-2.5-flash` — it retires on 2026-10-20;
-`gemini-3.8-flash` is the most capable Flash if you want to trade cost for
-accuracy. And Gemini 3 models cannot disable thinking, with thinking tokens
-billed against the same budget as the answer, so `LLM_REASONING_EFFORT=low` and
-a roomy `LLM_MAX_TOKENS` are set by default — without them a long extraction
-prompt can spend its whole budget reasoning and return an empty string.
+| Provider | `LLM_BASE_URL` | `LLM_MODEL` | Free-tier ceiling | Runs |
+|---|---|---|---|---|
+| **Mistral** (default) | `https://api.mistral.ai/v1` | `mistral-small-latest` | ~1 req/**sec**, 500k TPM, 1B tok/month | ~2,000/month |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash-lite` | 1,000 req/**day** | ~4/day |
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | 1,000 RPD but **100k tok/day** | ~¼ of a city |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash` | paid | — |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` | paid, most reliable | — |
 
-On a free-tier key, lower `LLM_MAX_CONCURRENCY` to 2 or 3. Extraction and
-fact-checking fan out in parallel, and the client retries rate limits with
-backoff, but staying under the limit is faster than recovering from it.
+Groq looks best on requests — 14,400/day on `llama-3.1-8b-instant` — but that
+model allows only 6k tokens per minute, and one extraction call carrying a page
+body can exceed a whole minute's budget by itself. Avoid Gemini 3.x previews
+entirely: they cap at **20 requests/day**, which cannot finish a single pass.
+
+Two settings break a provider switch outright if you get them wrong:
+
+- **`LLM_REASONING_EFFORT` must be empty** unless the model actually thinks.
+  OpenAI-compatible shims *reject* parameters they do not implement rather than
+  ignoring them, so a stray value fails every call with an opaque 400. Set it
+  to `low` on Gemini 3 or OpenAI o-series, where thinking tokens otherwise come
+  out of the answer's budget and a long prompt returns an empty string.
+- **`GRAPHITI_SEMAPHORE_LIMIT`** bounds Graphiti's own concurrency, which
+  `LLM_MAX_CONCURRENCY` does not reach. `graphiti-core` defaults to 20 parallel
+  extraction calls, and it is the largest caller in the run.
+
+Keep `LLM_MAX_CONCURRENCY` at or under the provider's requests-per-second
+allowance — 1 on Mistral's free plan, 8 on a per-day provider for roughly 8×
+the speed. Rate limits are retried with backoff, but staying under the limit is
+faster than recovering from it.
+
+If you would rather pay than migrate, Gemini Tier 1 on `gemini-2.5-flash-lite`
+costs roughly **$0.10 per city**.
 
 **Embeddings are generated locally** by sentence-transformers, shared between
 Milvus and Graphiti's embedder *and* its reranker. That is deliberate: the
@@ -214,7 +235,7 @@ Milvus Lite database on a named volume.
 **It starts exactly one container.** That is intentional, and worth being able
 to explain: of the three datastores, only one is a server. SQLite is a library
 writing to a file, Milvus Lite is a library writing to a file, and Neo4j is the
-hosted Sandbox. Three datastores, one process, no orchestration. Of the seven
+hosted Sandbox. Three datastores, one process, no orchestration. Of the eight
 dependent services, only two — the LLM provider and the Neo4j Sandbox — have to
 exist before the app will do real research.
 

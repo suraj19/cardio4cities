@@ -51,6 +51,40 @@ Rules:
 Return ONLY a JSON list: [{"text": "...", "is_city_level": true|false}, ...]"""
 
 
+# The content types we can turn into prose, and the parser that does it
+# reliably. Matched exactly on the MIME type rather than by substring, which
+# is what the previous check did and got wrong in both directions: anything
+# containing "text" was accepted, so text/csv and text/javascript reached an
+# HTML parser and then the model as though they were pages, while an XML feed
+# was accepted or rejected depending on which of two equivalent content types
+# the server happened to send. text/xml passed and was parsed as HTML — which
+# is what bs4's XMLParsedAsHTMLWarning was reporting — and application/xml,
+# the same document, was refused.
+#
+# Note there is deliberately no warnings filter for that warning. It fires
+# whenever markup is parsed in the wrong mode, so silencing it would also
+# silence the case where a server mislabels XML as text/html and we really
+# are using the wrong parser.
+_PARSER_FOR_TYPE: dict[str, str | None] = {
+    "text/html": "lxml",
+    "application/xhtml+xml": "lxml",
+    # Feeds and sitemaps. Thin material, but city health departments do
+    # publish announcements this way, and "lxml-xml" reads them properly.
+    "text/xml": "lxml-xml",
+    "application/xml": "lxml-xml",
+    "application/rss+xml": "lxml-xml",
+    "application/atom+xml": "lxml-xml",
+    # Already prose; there is no markup to strip.
+    "text/plain": None,
+}
+
+_MIN_USABLE_CHARS = 200
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _mock_fetch(url: str) -> str:
     if "resolvetosavelives" in url:
         return (
@@ -79,26 +113,60 @@ def _real_fetch(url: str) -> str:
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
-    if "html" not in content_type and "text" not in content_type:
+    mime = content_type.split(";")[0].strip().lower()
+    if mime not in _PARSER_FOR_TYPE:
         # PDFs and datasets are common on government portals and are worth
         # supporting eventually, but silently feeding their bytes to an LLM
         # produces confident nonsense, so they are skipped and logged instead.
-        raise ValueError(f"unsupported content type '{content_type}'")
+        raise ValueError(f"unsupported content type '{content_type or 'none sent'}'")
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-        tag.decompose()
+    parser = _PARSER_FOR_TYPE[mime]
+    if parser is None:
+        text = _collapse_whitespace(resp.text)
+    else:
+        soup = BeautifulSoup(resp.text, parser)
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+            tag.decompose()
 
-    # An explicit meta robots noindex is the HTML-level equivalent of the
-    # X-Robots-Tag header the crawlability agent checks, and can only be seen
-    # once the body is in hand — so it is honoured here, at the last moment
-    # before the content is used.
-    meta = soup.find("meta", attrs={"name": re.compile(r"^robots$", re.I)})
-    if meta and "noindex" in (meta.get("content") or "").lower():
-        raise ValueError("page carries <meta name='robots' content='noindex'>")
+        # An explicit meta robots noindex is the HTML-level equivalent of the
+        # X-Robots-Tag header the crawlability agent checks, and can only be
+        # seen once the body is in hand — so it is honoured here, at the last
+        # moment before the content is used.
+        meta = soup.find("meta", attrs={"name": re.compile(r"^robots$", re.I)})
+        if meta and "noindex" in (meta.get("content") or "").lower():
+            raise ValueError("page carries <meta name='robots' content='noindex'>")
 
-    text = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+        text = _collapse_whitespace(soup.get_text(" "))
+
+    # A page that parsed but yielded almost nothing is not worth a model call:
+    # extraction costs one call per source, so an empty page buys an empty
+    # answer at full price. Reported rather than passed on silently.
+    if len(text) < _MIN_USABLE_CHARS:
+        raise ValueError(
+            f"only {len(text)} characters of readable text (needs "
+            f"{_MIN_USABLE_CHARS})"
+        )
+
     return text[: settings.PASSAGE_CHAR_LIMIT]
+
+
+def _missing_parser_dependency() -> str | None:
+    """Which HTML-parsing dependency is absent, if any.
+
+    Checked once per pass rather than per URL, because this is a fault in the
+    environment and not a property of any particular source. Left to surface
+    per-source — which is what used to happen — a missing `bs4` produced one
+    "Could not read <url>" warning for every candidate: dozens of identical
+    lines that read like the entire web had gone down, with the real cause
+    (a dependency that was never installed) repeated in each one and obvious
+    in none.
+    """
+    for module, package in (("bs4", "beautifulsoup4"), ("lxml", "lxml")):
+        try:
+            __import__(module)
+        except ImportError:
+            return package
+    return None
 
 
 def _claim_id(url: str, index: int) -> str:
@@ -175,14 +243,40 @@ def extraction_node(state: CityResearchState) -> dict:
     # Passages accumulate across retries, so re-extracting a URL already
     # processed would duplicate every claim it produced — and with it the
     # audit rows, the graph episodes and the report bullets.
-    already_extracted = {p.url for p in state.get("passages", [])}
+    #
+    # `attempted_urls` covers the other half of that, which `passages` alone
+    # cannot: a URL whose *fetch failed* yields no passage, so every retry
+    # pass used to pick it up again. Three attempts per dead link, and the
+    # same failure warning printed three times in the brief.
+    done = {p.url for p in state.get("passages", [])} | set(
+        state.get("attempted_urls", [])
+    )
     todo = [
         candidates_by_url[url]
         for url in allowed_urls
-        if url not in already_extracted and url in candidates_by_url
+        if url not in done and url in candidates_by_url
     ]
     if not todo:
         return {"passages": [], "claims": []}
+
+    # One environment check for the whole pass, before any network work.
+    if not settings.is_mock:
+        missing = _missing_parser_dependency()
+        if missing:
+            return {
+                "passages": [],
+                "claims": [],
+                # Not marked attempted: these URLs were never actually tried,
+                # and once the dependency is installed they should be.
+                "warnings": [
+                    f"No source could be read because '{missing}' is not installed "
+                    f"in this environment — every one of the {len(todo)} allowed "
+                    f"source(s) would fail identically, so none were fetched. "
+                    f"This is a deployment fault, not a research finding: the "
+                    f"gaps in this brief mean 'not established', not 'nothing to "
+                    f"find'. Fix with `pip install -r requirements.txt`."
+                ],
+            }
 
     with ThreadPoolExecutor(max_workers=settings.LLM_MAX_CONCURRENCY) as pool:
         outcomes = list(pool.map(lambda c: _process_source(c, city), todo))
@@ -197,4 +291,12 @@ def extraction_node(state: CityResearchState) -> dict:
         if warning:
             warnings.append(warning)
 
-    return {"passages": passages, "claims": claims, "warnings": warnings}
+    return {
+        "passages": passages,
+        "claims": claims,
+        "warnings": warnings,
+        # Recorded whether or not the fetch worked, which is the point: a URL
+        # that failed has still been tried, and a later pass re-trying it
+        # spends the same requests to produce the same warning.
+        "attempted_urls": [c.url for c in todo],
+    }

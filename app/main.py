@@ -18,12 +18,12 @@ the POST response would make provenance a property of one HTTP call
 rather than of the system.
 """
 import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,18 @@ from app.models.schemas import ConfidenceTier, CrawlVerdict, ResearchRequest, di
 from app.stores.graph_store import graph_store
 from app.stores.relational_store import relational_store
 from app.stores.vector_store import vector_store
+
+# Uvicorn configures its own loggers and leaves the root logger at WARNING, so
+# without this the pipeline's per-node progress lines are created and then
+# discarded — the exact symptom is a terminal that prints the access log line
+# for POST /research minutes after it prints nothing else, which reads as a
+# hang. basicConfig only installs a handler when the root has none, which is
+# the case under uvicorn, so it adds our output without disturbing its.
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 app = FastAPI(title="CARDIO4Cities City Intelligence")
 
@@ -69,11 +81,6 @@ def _clean_city(city: str) -> str:
     if not city:
         raise HTTPException(status_code=400, detail="City must not be empty.")
     return city[:120]
-
-app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
-@app.get("/")
-async def read_index():
-    return FileResponse("frontend/index.html")
 
 
 @app.get("/health")

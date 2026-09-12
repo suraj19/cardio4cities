@@ -9,7 +9,7 @@ sentence-transformers rather than through an API. Two reasons.
    Groq) expose no embeddings endpoint at all — pointing Graphiti's
    OpenAIEmbedder at them returns 404 on every write. Embedding locally
    means the provider only has to serve chat completions, so DeepSeek,
-   Gemini, Groq and OpenAI are interchangeable via two env vars.
+   Mistral, Gemini, Groq and OpenAI are interchangeable via two env vars.
 2. Milvus and Graphiti then share one loaded model instead of two,
    which matters on a small demo VM.
 
@@ -32,7 +32,14 @@ def get_model():
 
 
 def embedding_dim() -> int:
-    return get_model().get_sentence_embedding_dimension()
+    # `get_sentence_embedding_dimension` was renamed to `get_embedding_dimension`.
+    # The old name still works but emits a FutureWarning, and both the vector
+    # store and Graphiti's embedder call this during setup — so the warning
+    # showed up twice in the startup log of every run. Preferring the new name
+    # keeps this working on both sides of the rename.
+    model = get_model()
+    getter = getattr(model, "get_embedding_dimension", None)
+    return getter() if getter else model.get_sentence_embedding_dimension()
 
 
 def embed_one(text: str) -> list[float]:

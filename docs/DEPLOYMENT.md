@@ -8,8 +8,8 @@ URL. [README.md](../README.md) covers what the application does;
 
 ## 1. Dependent services at a glance
 
-Seven things the application talks to. Only **two** are mandatory for a live
-demo, and only **one** of the seven is a server you have to operate yourself.
+Eight things the application talks to. Only **two** are mandatory for a live
+demo, and only **one** of the eight is a server you have to operate yourself.
 
 | # | Service | Role | Runs where | Required? | Cost |
 |---|---|---|---|---|---|
@@ -17,9 +17,10 @@ demo, and only **one** of the seven is a server you have to operate yourself.
 | 2 | **SQLite** | Relational store — source registry, fact audit trail, gaps, saved briefs | Embedded. A file on the app's volume | **Yes** | Free |
 | 3 | **Milvus** | Vector store — semantic recall over extracted passages | Embedded (Milvus Lite, default), or a standalone cluster, or Zilliz Cloud | **Yes** — but Lite needs no server | Free (Lite) |
 | 4 | **Neo4j Graph Database Sandbox** | Temporal knowledge graph, written through Graphiti | Hosted by Neo4j at [sandbox.neo4j.com](https://sandbox.neo4j.com) | **Yes** in LIVE mode | Free, **expires** |
-| 5 | **LLM provider** (Gemini by default) | Query planning, claim extraction, fact-check adjudication, narrative, `/ask` | Hosted, any OpenAI-compatible chat endpoint | **Yes** in LIVE mode | Free tier is enough |
+| 5 | **LLM provider** (Mistral by default) | Query planning, claim extraction, fact-check adjudication, narrative, `/ask` | Hosted, any OpenAI-compatible chat endpoint | **Yes** in LIVE mode | Free tier is enough — but see §3.5, the choice is throughput-bound |
 | 6 | **Tavily** | Higher-quality search discovery | Hosted | No — falls back to DuckDuckGo | Free tier |
 | 7 | **sentence-transformers** (`all-MiniLM-L6-v2`) | Local embeddings, shared by Milvus and Graphiti | In-process, baked into the image | **Yes** | Free, no key |
+| 8 | **WHO GHO + World Bank Open Data** | Country-level indicators for `cv_burden` and `health_system` | Hosted, public REST | No — falls back to web discovery | Free, **no key** |
 
 Two things follow from this table, and both are worth being able to say out
 loud in a review:
@@ -41,8 +42,9 @@ graph LR
   A --> M[(Milvus Lite<br/>embedded file)]
   A --> E[sentence-transformers<br/>in-process]
   A -.bolt.-> N[(Neo4j Sandbox<br/>hosted)]
-  A -.https.-> L[LLM provider<br/>Gemini / DeepSeek / Groq / OpenAI]
+  A -.https.-> L[LLM provider<br/>Mistral / Gemini / Groq / OpenAI]
   A -.https.-> T[Tavily or DuckDuckGo]
+  A -.https.-> O[WHO GHO + World Bank<br/>public REST, no key]
 
   subgraph vol["Docker volume app-data"]
     S
@@ -219,28 +221,54 @@ Any OpenAI-compatible chat endpoint. Only chat completions are used — no
 embeddings endpoint is required, which is why providers without one still
 work.
 
-| Provider | `LLM_BASE_URL` | `LLM_MODEL` | Notes |
-|---|---|---|---|
-| **Google Gemini** (default) | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.5-flash` | Free tier; strongest JSON adherence, which the graph layer depends on. Key from [AI Studio](https://aistudio.google.com/apikey) |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash` | Cheapest paid option |
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | Fastest. Clear `LLM_REASONING_EFFORT` — it rejects the parameter |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` | |
-| Ollama (self-hosted) | `http://host.docker.internal:11434/v1` | any local model | No key needed; quality of structured extraction drops sharply below ~30B |
+**Choose on throughput, not capability.** A single city costs 150–250 calls
+and 400–600k tokens: roughly 80 of ours plus Graphiti's entity extraction,
+which runs several calls per fact and is usually the larger half. Free tiers
+meter that two different ways, and only one is survivable — a per-second limit
+just makes a batch job slower, while a per-day cap stops it dead until
+tomorrow.
 
-Two provider-specific settings that cause confusing failures if ignored:
+| Provider | `LLM_BASE_URL` | `LLM_MODEL` | Free-tier ceiling | Runs |
+|---|---|---|---|---|
+| **Mistral** (default) | `https://api.mistral.ai/v1` | `mistral-small-latest` | ~1 req/**sec**, 500k TPM, 1B tok/month | ~2,000/month |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash-lite` | 1,000 req/**day** | ~4/day |
+| Google Gemini | as above | `gemini-3.x` previews | **20 req/day** | cannot finish one pass |
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | 1,000 RPD but **100k tok/day** | ~¼ of one city |
+| Groq | as above | `llama-3.1-8b-instant` | 14,400 RPD but **6k TPM** | one page body exceeds a minute's budget |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash` | paid | — |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` | paid | — |
+| Ollama (self-hosted) | `http://host.docker.internal:11434/v1` | any local model | unmetered | no key needed; structured extraction degrades sharply below ~30B |
 
-- **`LLM_MAX_CONCURRENCY`** bounds parallel calls during extraction and
-  fact-checking. The Gemini free tier wants this at **2 or 3**; the default of
-  8 will hit rate limits. Retries with exponential backoff are built in, but
-  they cost wall-clock time.
-- **`LLM_REASONING_EFFORT=low`.** Gemini 3 always thinks, and thinking tokens
-  come out of the same budget as the answer. Left unbounded, a long extraction
-  prompt can spend the whole budget reasoning and return an empty string.
+If you would rather pay than migrate, Gemini Tier 1 on `gemini-2.5-flash-lite`
+($0.10/1M in, $0.40/1M out) works out to roughly **$0.10 per city**.
+
+Four settings cause confusing failures if ignored. The first two are the ones
+that break a provider switch outright:
+
+- **`LLM_REASONING_EFFORT`** must be **empty** on providers that do not
+  implement it — which includes the default. An OpenAI-compatible shim
+  *rejects* a parameter it does not support rather than ignoring it, so a
+  stray value fails every call with an opaque 400. Set it to `low` only on a
+  thinking model (Gemini 3, OpenAI o-series), where thinking tokens otherwise
+  come out of the answer's budget and a long extraction prompt returns `""`.
+- **`GRAPHITI_SEMAPHORE_LIMIT`** bounds Graphiti's *own* concurrency, which
+  `LLM_MAX_CONCURRENCY` does not govern. `graphiti-core` reads `SEMAPHORE_LIMIT`
+  once at module scope and defaults to **20**. Graphiti is the largest consumer
+  of calls in a run, so leaving it at 20 against a per-second limit puts the
+  retry storm exactly where it hurts most. This is the setting people miss.
+- **`LLM_MAX_CONCURRENCY`** bounds our thread pool during extraction and
+  fact-checking. Keep it at or below the provider's requests-per-second
+  allowance — **1** for Mistral's free plan, **8** on a per-day provider for
+  roughly 8× the speed. Retry with exponential backoff is built in, but a
+  throttled run spends its time waiting rather than working.
+- **`GRAPHITI_MAX_TOKENS`** needs headroom because Graphiti has no
+  reasoning-effort knob. Too low shows up as a graph with no fact edges rather
+  than as an error.
 
 ### 3.6 Tavily (optional)
 
 Improves source discovery. Without a key the app falls back to
-`duckduckgo-search`, which needs no credentials and returns noisier results.
+`ddgs`, which needs no credentials and returns noisier results.
 
 ```bash
 TAVILY_API_KEY=tvly-...
@@ -248,7 +276,36 @@ TAVILY_API_KEY=tvly-...
 
 Nothing else changes; the fallback is automatic and silent.
 
-### 3.7 Embedding model
+### 3.7 WHO GHO and World Bank Open Data (optional)
+
+No deployment step, no account, no key — two public REST endpoints:
+
+- `https://ghoapi.azureedge.net/api/{indicator}` — WHO Global Health
+  Observatory, OData. Filtered by `$filter=SpatialDim eq 'IND'`.
+- `https://api.worldbank.org/v2/country/{iso3}/indicator/{code}?format=json` —
+  World Bank Indicators.
+
+These serve `cv_burden` and `health_system`. All outbound HTTPS, so the only
+infrastructure requirement is egress on 443.
+
+```bash
+ENABLE_OFFICIAL_DATA=true   # set false to demo web discovery on its own
+```
+
+Two operational facts worth knowing before they surprise you:
+
+- **They are country-level.** A run needs `country` in the request body or
+  this path is skipped with a warning. Everything it produces is flagged as
+  national context, never as a city finding.
+- **Indicator codes get archived, and the failure is quiet.** The World Bank
+  returns **HTTP 200** with a message object where the data array should be —
+  `SH.UHC.SRVS.CV.XD` does this today. WHO GHO can return HTTP 200 with zero
+  rows for a country, which is why `WHS2_161` is not in the indicator list
+  despite being the most on-topic name in the catalogue. `check_services.py`
+  pulls a real value rather than checking a status code, precisely because a
+  status code cannot see this.
+
+### 3.8 Embedding model
 
 No deployment step. `all-MiniLM-L6-v2` (384-dim, ~90 MB) is downloaded during
 `docker build` and loaded lazily on first use, shared by the Milvus store and
@@ -345,14 +402,36 @@ of degraded modes is in
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `POST /research` appears to hang — nothing logged after `GET /cities` | Normally not a hang: a thorough run is 10–20 minutes and uvicorn only logs a request once it *completes*. `LOG_LEVEL=INFO` now prints each node with its duration | Watch the node log. If `graph_writer` is the slow one that is expected — Graphiti re-extracts entities for every fact. Use the demo profile in `.env.example` §Cost |
+| The very first run is slow before any node finishes | `sentence-transformers` downloads `all-MiniLM-L6-v2` (~90 MB) lazily on the first embed | One-off. It is cached afterwards; pre-warm with `python -c "from app.llm import embeddings; embeddings.get_model()"` |
 | `/health` reports `graph: unreachable`; `/graph/{city}` returns 503 | Sandbox expired or was restarted | Re-copy **both** the Bolt URI and the password from sandbox.neo4j.com |
-| Research completes but the brief is nearly all Gaps | LLM returning empty or malformed output | Check `LLM_API_KEY`; raise `LLM_MAX_TOKENS`; confirm `LLM_REASONING_EFFORT=low` |
+| Research completes but the brief is nearly all Gaps | LLM returning empty or malformed output | Check `LLM_API_KEY`; raise `LLM_MAX_TOKENS`. On a *thinking* model also set `LLM_REASONING_EFFORT=low`, since thinking tokens can consume the whole answer budget |
+| Run Warnings say *"No source could be read because 'beautifulsoup4' is not installed"* | The HTML parser is missing from the environment running uvicorn, so no page can be parsed | `pip install -r requirements.txt` **in the interpreter uvicorn is using**. Confirm with `python scripts/check_services.py`, whose first check is now the import list |
+| A **"Could not read \<url\>"** warning for every single source | Same cause as above, on a build predating the single-warning check | As above. If the errors differ per URL it is genuinely the sites, not you |
+| `XMLParsedAsHTMLWarning: It looks like you're using an HTML parser to parse an XML document` | An RSS/Atom feed or sitemap served as `text/xml`, which the old substring content-type check let through to the HTML parser | Fixed: content types are matched exactly and XML gets `lxml-xml`. If it still appears, a server is mislabelling XML as `text/html` — the warning is then correct and worth reading, which is why it is **not** filtered |
+| Warnings saying *"unsupported content type"* | Working as designed. PDFs, CSVs and JSON are refused rather than fed to the model as prose | Nothing to fix. Many government portals publish as PDF; supporting them is future work, not a failure |
+| Warnings saying *"only N characters of readable text"* | The page parsed but is essentially empty — a JS-rendered shell, a login wall, or a redirect stub | Nothing to fix. Dropping it saves a model call that could only have returned nothing |
+| 429 with `'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'` and `'quotaValue': '20'` | A Gemini 3.x **preview** model is selected. Those allow 20 requests/day; one city needs 150–250 | Switch to a provider metered per *second* rather than per *day* — see the table in `.env.example`. The shipped default (Mistral Small, free Experiment plan) is ~1 RPS with 1B tokens/month |
+| Every LLM call fails with an opaque 400 right after switching provider | `LLM_REASONING_EFFORT` is set on a provider that doesn't implement it. Unimplemented parameters are **rejected**, not ignored | Clear `LLM_REASONING_EFFORT` in `.env`. Only set it on thinking models (Gemini 3, OpenAI o-series) |
+| 401 / "API key not valid" right after switching provider | Keys are per-provider; the base URL changed but the key didn't | Issue a key from the provider that owns `LLM_BASE_URL`. `check_services.py` now says this explicitly |
+| Constant 429s and `Retrying _generate_response_with_retry after N attempts` | Concurrency exceeds the provider's requests-per-second allowance. Graphiti is the biggest caller and has its **own** limit | Set `LLM_MAX_CONCURRENCY=1` **and** `GRAPHITI_SEMAPHORE_LIMIT=1`. The second one is the one people miss — `graphiti-core` defaults to 20 concurrent calls |
+| Quota exhausts partway, then the brief fills with off-topic sources | Query planning fell back to keyword templates once the LLM stopped answering, so searches went generic. Cascade, not a search bug | Fix the quota first, then re-run. The irrelevant URLs are a symptom |
 | Brief warns *"Query planning fell back to keyword templates"* | The LLM was unreachable on that pass | Working as designed — the run continued on generic searches. Check the provider and the key |
-| Brief is entirely Gaps citing *"Search returned no candidate sources"* | No outbound internet, or the search provider is blocked | Check egress from the VM; confirm `TAVILY_API_KEY` if set |
+| Brief is entirely Gaps citing *"Search returned no candidate sources"* | No outbound internet, or the search provider is blocked | **Read the Run Warnings first** — a provider failure now names itself and the exception type there. Silence means search really did return nothing |
+| Run Warnings say *"DuckDuckGo search failed (ImportError...)"* | The `duckduckgo-search` package was renamed; an old virtualenv still has the pre-rename name | `pip install -U ddgs` |
+| Run Warnings say *"DuckDuckGo search failed (... Ratelimit)"* | `ddgs` scrapes consumer engines and a pass issues ~10 queries back to back | Set `TAVILY_API_KEY`, or lower `QUERIES_PER_DIMENSION` |
+| Sources tab is **empty** after a run | Discovery failed, so the LLM was never reached | This is a search problem, not a quota problem. Sources tab populated but no facts is the opposite case |
 | Brief has facts, but `/graph/{city}` and the Knowledge graph tab are empty | Graph writes failed and were downgraded to a warning | Read the Run Warnings. `TypeError`/`AttributeError` means a `graphiti-core` version mismatch; anything else is the Sandbox |
 | Neo4j logs *"property key does not exist"* for `episodes` / `fact_embedding` | Advisory only, but it means **no fact edges exist** — those keys only appear once an edge is written | Run `check_services`; if nodes > 0 and fact edges = 0, the writes are failing. `reference_time` warns permanently and can be ignored |
 | `check_services` shows nodes but **0 fact edges** | Entity extraction returned nothing, or writes failed | Raise `GRAPHITI_MAX_TOKENS`; a thinking model can spend the whole budget reasoning and return empty |
+| Brief warns *"Skipped official statistics: ... no country was supplied"* | WHO GHO and the World Bank are keyed by country | Send `country` in the request body — the UI form has the field |
+| Brief warns *"publishes no usable {code} value"* | That indicator has been archived, or has no rows for this country | Working as designed; the dimension still has its other indicators and the web path. Replace the code in `official_data_agent.py` if it is permanent |
+| No WHO or World Bank facts at all, no warning either | `ENABLE_OFFICIAL_DATA` is false, or neither served dimension was in focus | Check `.env`; the path only runs for `cv_burden` and `health_system` |
 | Run is very slow, logs show retries | Provider rate limiting | Lower `LLM_MAX_CONCURRENCY` to 2–3 |
+| `DataNotMatchException: {id} field should be a int64` | A `city_passages` collection from an earlier build has an Int64 primary key; passage ids are URL hashes | Fixed automatically now — the store validates the schema on init and recreates a mismatched collection. If you are on older code, delete `./data/milvus.db` |
+| Startup logs *"Milvus collection ... is unusable"* | The self-repair above just ran | Informational. Passage embeddings for already-researched cities were dropped and rebuild on the next run for those cities |
+| `FutureWarning: get_sentence_embedding_dimension ... renamed` | sentence-transformers 5.x renamed the method | Fixed; `embedding_dim()` now prefers `get_embedding_dimension` and falls back |
+| Log floods with *"Retrying _generate_response_with_retry"* | Graphiti's own entity extraction is being rate-limited | **This is the LLM provider, not Neo4j.** Graphiti runs several model calls per fact, so it is usually the largest LLM consumer and first to hit a free-tier quota. Check the Run Warnings for the fact-level count |
 | `ModuleNotFoundError: milvus_lite` | Native Windows | Run in Docker or WSL2, or point `MILVUS_URI` at a server |
 | First request hangs ~60s | Embedding model loading | Expected once per container start; the healthcheck's 40s start period covers it |
 | Many sources DENIED | robots.txt or the ToS denylist | Working as intended — `/sources/{city}` lists each URL with its reason |

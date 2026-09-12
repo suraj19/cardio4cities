@@ -186,7 +186,13 @@ def report_node(state: CityResearchState) -> dict:
     if warnings:
         lines += ["## Run Warnings", "",
                   "_Degraded behaviour during this run, recorded rather than hidden._", ""]
-        for warning in warnings:
+        # Deduplicated, order preserved. `warnings` is an append channel and the
+        # retry loop re-runs every node, so a condition that persists across
+        # passes — a dead dependency, an exhausted quota — is recorded once per
+        # pass. Printed verbatim that became the same paragraph three times,
+        # which reads like three separate incidents and buries the distinct
+        # warnings between the copies.
+        for warning in dict.fromkeys(warnings):
             lines.append(f"- {warning}")
         lines.append("")
 

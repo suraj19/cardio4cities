@@ -32,6 +32,38 @@ from app.stores.graph_store import graph_store
 from app.stores.relational_store import relational_store
 from app.stores.vector_store import vector_store
 
+_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "429", "quota", "resource_exhausted")
+
+
+def _graph_failure_hint(exc: Exception) -> str:
+    """Point the reader at the system that is actually broken.
+
+    Three failures reach this path and they need three different answers. A
+    TypeError is a Graphiti API mismatch, so naming the Sandbox would send
+    someone to debug the wrong system entirely. A rate limit is the LLM
+    provider, which is unobvious here: Graphiti runs its own entity
+    extraction per episode, so writing the graph costs several model calls per
+    fact and is usually the first thing to exhaust a free-tier quota — the
+    symptom being a storm of `Retrying _generate_response_with_retry` lines.
+    Anything else is most likely the Sandbox having expired.
+    """
+    if isinstance(exc, (TypeError, AttributeError, ImportError)):
+        return (
+            "This is an API mismatch, not an outage — check the installed "
+            "graphiti-core against the version in requirements.txt."
+        )
+
+    message = f"{type(exc).__name__}: {exc}".lower()
+    if any(marker in message for marker in _RATE_LIMIT_MARKERS):
+        return (
+            "This is the LLM provider's rate limit, not Neo4j. Graphiti runs "
+            "its own entity extraction for every episode, so each fact costs "
+            "several model calls — it is normally the largest LLM consumer in "
+            "a run and the first thing to hit a free-tier quota."
+        )
+
+    return "Check the Neo4j Sandbox has not expired."
+
 
 async def graph_writer_node(state: CityResearchState) -> dict:
     city = state["city"]
@@ -75,33 +107,47 @@ async def graph_writer_node(state: CityResearchState) -> dict:
         )
 
     # --- Graph: Neo4j/Graphiti, evidence-linked facts ---
+    # The city node and the individual facts are handled separately because
+    # their failures mean different things. Without the city node there is
+    # nothing for facts to attach to, so that aborts the graph step; but one
+    # fact failing should cost that fact alone. These used to share a single
+    # try block, which meant the first bad episode abandoned every fact after
+    # it — so on a rate-limited provider a single 429 produced an entirely
+    # empty graph instead of a partial one.
     try:
         await graph_store.upsert_city(city)
-        for fc in persistable:
-            await graph_store.add_programme_fact(
-                city=city,
-                claim_text=fc.text,
-                dimension=fc.dimension,
-                tier=fc.tier.value,
-                source_urls=fc.evidence_urls,
-                claim_id=fc.claim_id,
-            )
     except Exception as exc:
-        # The hint has to depend on the exception class. A TypeError here is a
-        # Graphiti API mismatch, not an outage, and pointing the reader at the
-        # Sandbox in that case sends them to debug the wrong system entirely.
-        if isinstance(exc, (TypeError, AttributeError, ImportError)):
-            hint = (
-                "This is an API mismatch, not an outage — check the installed "
-                "graphiti-core against the version in requirements.txt."
-            )
-        else:
-            hint = "Check the Neo4j Sandbox has not expired."
         warnings.append(
             f"Graph store unavailable ({type(exc).__name__}: {exc}) — facts are "
             f"still in the relational audit trail, but graph exploration is "
-            f"unavailable for this run. {hint}"
+            f"unavailable for this run. {_graph_failure_hint(exc)}"
         )
+    else:
+        failures: list[Exception] = []
+        for fc in persistable:
+            try:
+                await graph_store.add_programme_fact(
+                    city=city,
+                    claim_text=fc.text,
+                    dimension=fc.dimension,
+                    tier=fc.tier.value,
+                    source_urls=fc.evidence_urls,
+                    claim_id=fc.claim_id,
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        if failures:
+            # One warning for the batch, not one per fact: these fail for the
+            # same reason in practice, and 40 identical lines would bury the
+            # rest of the run's warnings.
+            example = failures[0]
+            warnings.append(
+                f"{len(failures)} of {len(persistable)} fact(s) could not be "
+                f"written to the knowledge graph ({type(example).__name__}: "
+                f"{example}). The others were written, and all of them are in "
+                f"the relational audit trail. {_graph_failure_hint(example)}"
+            )
 
     return {
         "gaps": new_gaps,

@@ -1,7 +1,11 @@
 """
 Thin wrapper around any OpenAI-compatible chat-completions endpoint —
-Gemini (the default), DeepSeek, Groq, OpenRouter, OpenAI or a local
-Ollama, selected by LLM_BASE_URL and LLM_MODEL alone.
+Mistral (the default), Gemini, DeepSeek, Groq, OpenRouter, OpenAI or a
+local Ollama, selected by LLM_BASE_URL and LLM_MODEL alone.
+
+"Compatible" is not uniform: a shim will typically reject a parameter it
+does not implement rather than ignore it, so optional fields are only
+included when configured. See the reasoning_effort handling below.
 
 In MOCK mode, returns deterministic canned responses so the graph can be
 exercised with zero API keys/internet.
