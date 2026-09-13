@@ -16,12 +16,15 @@ running Neo4j instance.
 """
 import os
 
-os.environ.setdefault("RUN_MODE", "MOCK")
+# Assigned, not setdefault: an inherited RUN_MODE=LIVE would take this suite
+# to the real internet and hang there. See tests/test_jobs.py.
+os.environ["RUN_MODE"] = "MOCK"
 # Keep test runs out of the development database.
 os.environ.setdefault("DATABASE_URL", "sqlite:///./data/test_cardio4cities.db")
 
 import pytest
 
+from app.config import settings
 from app.graph.workflow import WORKFLOW_CONFIG, workflow
 from app.models.schemas import (
     DIMENSIONS,
@@ -327,18 +330,170 @@ def test_a_claim_the_batch_omitted_is_re_asked_on_its_own(monkeypatch):
     assert tiers["c-2"] == ConfidenceTier.CONFLICTING
 
 
+def test_one_sentence_repeated_by_one_site_is_adjudicated_once(monkeypatch):
+    """Portals restate a programme across several pages, and a retry pass finds
+    them one at a time. Those copies share an origin domain, so they share a
+    corroboration pool and must reach the same verdict — paying for each
+    separately bought nothing."""
+    from app.agents import fact_check_agent
+
+    same_text = "The city runs a subsidised blood pressure screening programme."
+    claims = [
+        Claim(
+            claim_id=f"dup-{n}",
+            text=same_text if n != 3 else "A different claim entirely.",
+            source_url=f"https://a.example.org/page-{n}",
+            source_domain="a.example.org",
+            is_city_level=True,
+            dimension="healthcare_programmes",
+        )
+        for n in (1, 2, 3)
+    ]
+
+    prompts = _recording_checker(
+        monkeypatch,
+        [
+            '[{"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "a"},'
+            ' {"claim": "C2", "tier": "CONFLICTING", "reasoning": "b"}]'
+        ],
+    )
+
+    result = fact_check_agent.fact_check_node({"claims": claims, "passages": []})
+    facts = {f.claim_id: f for f in result["fact_checked"]}
+
+    # Two distinct questions were asked, not three.
+    assert prompts and same_text in prompts[0]
+    assert prompts[0].count(same_text) == 1, "the restatement was sent twice"
+
+    # Every claim still gets its own verdict row with its own origin URL —
+    # the dedupe must not cost a claim its place in the audit trail.
+    assert set(facts) == {"dup-1", "dup-2", "dup-3"}
+    assert facts["dup-1"].tier == facts["dup-2"].tier
+    assert facts["dup-2"].source_url == "https://a.example.org/page-2"
+
+
+def test_a_collapsed_restatement_keeps_its_own_national_flag(monkeypatch):
+    """`is_city_level` is decided by a separate extraction call per page, so two
+    pages on one domain can carry the same sentence and disagree about whether
+    it describes the city or the country.
+
+    The flag is therefore re-derived for each copy rather than inherited from
+    the representative. Copying it would publish country-level data as
+    city-specific, which is the one thing the field exists to prevent."""
+    from app.agents import fact_check_agent
+
+    same_text = "Hypertension prevalence among adults is 28 percent."
+    claims = [
+        Claim(
+            claim_id="city-level",
+            text=same_text,
+            source_url="https://a.example.org/city-page",
+            source_domain="a.example.org",
+            is_city_level=True,
+            dimension="cv_burden",
+        ),
+        Claim(
+            claim_id="national-level",
+            text=same_text,
+            source_url="https://a.example.org/country-page",
+            source_domain="a.example.org",
+            is_city_level=False,
+            dimension="cv_burden",
+        ),
+    ]
+
+    _recording_checker(
+        monkeypatch,
+        ['[{"claim": "C1", "tier": "SINGLE_SOURCE", "reasoning": "a",'
+         ' "national_vs_city_flag": false}]'],
+    )
+
+    result = fact_check_agent.fact_check_node({"claims": claims, "passages": []})
+    facts = {f.claim_id: f for f in result["fact_checked"]}
+
+    assert set(facts) == {"city-level", "national-level"}
+    assert facts["national-level"].national_vs_city_flag is True, (
+        "a national claim collapsed onto a city-level representative was "
+        "published as city-specific"
+    )
+    # And the flag is never lowered on the representative by the copy.
+    assert facts["city-level"].national_vs_city_flag is False
+
+
+def test_the_same_sentence_from_two_domains_is_not_collapsed(monkeypatch):
+    """The complement, and the one that matters for correctness: an identical
+    sentence from a different domain is corroboration, not a duplicate.
+    Collapsing those would destroy the independent-source count VERIFIED is
+    derived from."""
+    from app.agents import fact_check_agent
+
+    same_text = "The city runs a subsidised blood pressure screening programme."
+    claims = [
+        Claim(
+            claim_id=f"cross-{i}",
+            text=same_text,
+            source_url=f"https://{domain}/p",
+            source_domain=domain,
+            is_city_level=True,
+            dimension="healthcare_programmes",
+        )
+        for i, domain in enumerate(("a.example.org", "b.example.org"))
+    ]
+
+    prompts = _recording_checker(
+        monkeypatch, ['{"tier": "SINGLE_SOURCE", "reasoning": "a"}']
+    )
+
+    result = fact_check_agent.fact_check_node({"claims": claims, "passages": []})
+
+    assert len(prompts) == 2, "each domain must be adjudicated on its own"
+    assert len(result["fact_checked"]) == 2
+
+
 def test_context_window_is_chosen_for_relevance_not_taken_from_the_head():
     """Head-truncation costs the same tokens and routinely cut away the one
-    sentence that could settle the claim."""
-    from app.agents.fact_check_agent import _relevant_window, _tokens
+    sentence that could settle the claim.
+
+    Now shared by both call sites that send page text — the fact-checker
+    against a claim and the extractor against its dimension brief — so it
+    lives in app.util rather than in either agent.
+    """
+    from app.util import relevant_window, tokens
 
     needle = "The municipal hypertension screening programme covered 36 lakh residents."
     text = ("unrelated boilerplate navigation text. " * 60) + needle
 
-    window = _relevant_window(text, _tokens(needle), 200)
+    window = relevant_window(text, tokens(needle), 200)
 
     assert "hypertension screening programme" in window
     assert len(window) == 200, "the budget must be spent, not shrunk"
+
+
+def test_extraction_prompt_is_windowed_to_the_dimension_not_the_page_top():
+    """The extraction prompt is the run's largest single payload — one call
+    per source, carrying the page. Sending the dimension-relevant window
+    instead of the first N characters is what makes a smaller budget safe."""
+    from app.agents.extraction_agent import _focused_window
+    from app.models.schemas import ExtractedPassage
+
+    needle = (
+        "The city health department runs a hypertension screening drive at "
+        "primary health centres, launched in 2023."
+    )
+    passage = ExtractedPassage(
+        url="https://health.example.gov/programmes",
+        domain="example.gov",
+        title="Programmes",
+        text=("cookie notice and site navigation menu. " * 200) + needle,
+        dimension="healthcare_programmes",
+    )
+
+    window = _focused_window(passage, "Testopolis")
+
+    assert len(window) <= settings.EXTRACTION_CHAR_LIMIT
+    assert "hypertension screening drive" in window, (
+        "the window must follow the dimension brief, not the top of the page"
+    )
 
 
 # ---------------------------------------------------------------------

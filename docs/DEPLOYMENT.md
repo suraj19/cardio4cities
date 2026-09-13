@@ -17,7 +17,7 @@ demo, and only **one** of the eight is a server you have to operate yourself.
 | 2 | **SQLite** | Relational store — source registry, fact audit trail, gaps, saved briefs | Embedded. A file on the app's volume | **Yes** | Free |
 | 3 | **Milvus** | Vector store — semantic recall over extracted passages | Embedded (Milvus Lite, default), or a standalone cluster, or Zilliz Cloud | **Yes** — but Lite needs no server | Free (Lite) |
 | 4 | **Neo4j Graph Database Sandbox** | Temporal knowledge graph, written through Graphiti | Hosted by Neo4j at [sandbox.neo4j.com](https://sandbox.neo4j.com) | **Yes** in LIVE mode | Free, **expires** |
-| 5 | **LLM provider** (Mistral by default) | Query planning, claim extraction, fact-check adjudication, narrative, `/ask` | Hosted, any OpenAI-compatible chat endpoint | **Yes** in LIVE mode | Free tier is enough — but see §3.5, the choice is throughput-bound |
+| 5 | **LLM provider** (Mistral by default) | Query planning, claim extraction, fact-check adjudication, narrative, `/ask` | Hosted, any OpenAI-compatible chat endpoint | **Yes** in LIVE mode | $0 on Mistral's free plan, or ~$0.14/city paid — see §3.5 |
 | 6 | **Tavily** | Higher-quality search discovery | Hosted | No — falls back to DuckDuckGo | Free tier |
 | 7 | **sentence-transformers** (`all-MiniLM-L6-v2`) | Local embeddings, shared by Milvus and Graphiti | In-process, baked into the image | **Yes** | Free, no key |
 | 8 | **WHO GHO + World Bank Open Data** | Country-level indicators for `cv_burden` and `health_system` | Hosted, public REST | No — falls back to web discovery | Free, **no key** |
@@ -42,7 +42,7 @@ graph LR
   A --> M[(Milvus Lite<br/>embedded file)]
   A --> E[sentence-transformers<br/>in-process]
   A -.bolt.-> N[(Neo4j Sandbox<br/>hosted)]
-  A -.https.-> L[LLM provider<br/>Mistral / Gemini / Groq / OpenAI]
+  A -.https.-> L[LLM provider<br/>Mistral / DeepSeek / Gemini / Groq<br/>judgement + bulk models]
   A -.https.-> T[Tavily or DuckDuckGo]
   A -.https.-> O[WHO GHO + World Bank<br/>public REST, no key]
 
@@ -221,46 +221,129 @@ Any OpenAI-compatible chat endpoint. Only chat completions are used — no
 embeddings endpoint is required, which is why providers without one still
 work.
 
-**Choose on throughput, not capability.** A single city costs 150–250 calls
-and 400–600k tokens: roughly 80 of ours plus Graphiti's entity extraction,
-which runs several calls per fact and is usually the larger half. Free tiers
-meter that two different ways, and only one is survivable — a per-second limit
-just makes a batch job slower, while a per-day cap stops it dead until
-tomorrow.
+**Choose on the shape of the limit, not on capability or headline size.** A
+single city costs 150–250 calls and 400–600k tokens: roughly 80 of ours plus
+Graphiti's entity extraction, which runs several calls per fact and is usually
+the larger half. Free tiers meter that three different ways and only one is
+survivable:
 
-| Provider | `LLM_BASE_URL` | `LLM_MODEL` | Free-tier ceiling | Runs |
+| Metering | Effect on a run | Example |
+|---|---|---|
+| Per **day** | A wall. Stops unfinished, waits 24h | `gemini-3.5-flash` 20 req/day; Groq 70B 100k tok/day |
+| Per **month** | A budget. 600k against 1B is noise | Mistral 1B tok/month |
+| Per **second** | A throttle. Slower, still finishes | Mistral's request rate |
+
+Only the throttle is absorbable, and only because `POST /research` no longer
+holds an HTTP request open (see §4.1 and `app/jobs.py`). An hour-long run is
+now merely slow; before that change it was impossible on any host.
+
+**Two models, not one.** `LLM_MODEL` and `LLM_BULK_MODEL` are both set, and
+the split is the difference between cents and dollars per city:
+
+| Role | Setting | Calls/run | What it does |
+|---|---|---|---|
+| Judgement | `LLM_MODEL` | ~30 | Query planning, fact-check adjudication, the narrative, `/ask` |
+| Bulk | `LLM_BULK_MODEL` | ~120 | Claim extraction, and Graphiti's entity extraction behind the graph writes |
+
+The bulk calls turn text the model has been handed into JSON against a fixed
+schema. There is no judgement in them and nothing to deliberate about, which
+is why they also run at `LLM_BULK_REASONING_EFFORT=none` — thinking tokens
+bill at the **output** rate, so effort is a cost setting. Pointing both
+variables at the judgement model is the most expensive single change here:
+
+| Model | Input /1M | Output /1M (incl. thinking) | Free tier | ~Cost per city |
 |---|---|---|---|---|
-| **Mistral** (default) | `https://api.mistral.ai/v1` | `mistral-small-latest` | ~1 req/**sec**, 500k TPM, 1B tok/month | ~2,000/month |
-| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash-lite` | 1,000 req/**day** | ~4/day |
-| Google Gemini | as above | `gemini-3.x` previews | **20 req/day** | cannot finish one pass |
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | 1,000 RPD but **100k tok/day** | ~¼ of one city |
-| Groq | as above | `llama-3.1-8b-instant` | 14,400 RPD but **6k TPM** | one page body exceeds a minute's budget |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-flash` | paid | — |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4.1-mini` | paid | — |
-| Ollama (self-hosted) | `http://host.docker.internal:11434/v1` | any local model | unmetered | no key needed; structured extraction degrades sharply below ~30B |
+| `mistral-medium-latest` (judgement default) | $1.50 | $7.50 | **yes** | ~$1.40 if used for everything |
+| `mistral-large-latest` | $0.50 | $1.50 | **no — 403** | ~$0.38 if used for everything |
+| `mistral-small-latest` (bulk default) | $0.15 | $0.60 | **yes** | ~$0.11 if used for everything |
+| **The shipped split** (Medium + Small) | — | — | **yes** | **$0** free, ~$0.40 paid |
+| Large + Small (paid keys only) | — | — | no | **~$0.19** |
 
-If you would rather pay than migrate, Gemini Tier 1 on `gemini-2.5-flash-lite`
-($0.10/1M in, $0.40/1M out) works out to roughly **$0.10 per city**.
+Two things here are counter-intuitive and both were verified against a live
+free key rather than against documentation:
+
+1. **Mistral's generation numbers do not order by price.** Large 3 is *three
+   times cheaper* than Medium 3.5 ($0.50/$1.50 against $1.50/$7.50) as well as
+   stronger.
+2. **Large 3 is not served on the free tier.** It is absent from
+   `GET /v1/models` for a free key and returns `403 tier_not_allowed`
+   (code 1910) if requested anyway.
+
+Together those mean the shipped default is the *expensive* choice the moment
+you start paying. **On a paid key, set `LLM_MODEL=mistral-large-latest`** and a
+run drops from ~$0.40 to ~$0.19. The default is Medium only because it is the
+best judgement model a no-bill account can actually reach.
+
+> **Mistral's free "Experiment" plan is the only free tier that finishes a
+> city.** 1B tokens/month against 400–600k per run means volume is a
+> non-issue; you are throttled on request rate instead, and a throttle only
+> costs time. Requests on the free plan may also be used for training unless
+> you opt out in the Admin Console → Privacy.
+
+Mistral does not publish the free-tier request rate, and third-party figures
+for it disagree by two orders of magnitude. Do not trust either — every
+response carries the real answer:
+
+```
+x-ratelimit-limit-req-minute      your actual RPM ceiling
+x-ratelimit-remaining-req-minute  what is left in this window
+```
+
+**A ceiling of `0` is an account problem, not a throttle**, and it is the most
+confusing failure on this provider: the key authenticates fine, so you get
+`429 Rate limit exceeded` (code 1300) rather than a `401`, which sends you
+looking at your concurrency settings instead of your subscription. An
+unactivated Experiment plan looks exactly like this. Activate it in the Admin
+Console — phone verification, no card.
+
+**Other providers**, setting both variables each:
+
+| Provider | `LLM_BASE_URL` | Notes |
+|---|---|---|
+| DeepSeek | `https://api.deepseek.com/v1` | No free tier, but publishes **no RPM, TPM or RPD** — only 2500 concurrency, the best-shaped limit available for this workload. ~$0.13/city, halved again by its $0.003/1M cache-hit input on our repeated system prompts. Thinking defaults to **on at `high`**: clear `LLM_BULK_REASONING_EFFORT` and send `extra_body={"thinking": {"type": "disabled"}}`, since `minimal` is not a value it accepts |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.5-flash` / `gemini-3.1-flash-lite` at `low` / `minimal`. Tier 1 costs ~$0.45/city. The **free tier cannot finish one pass** — 20 req/day, failing with `quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier` |
+| Groq | `https://api.groq.com/openai/v1` | Fast, but **rejects** `reasoning_effort` — clear both settings or every call 400s. Free tier caps at 100k tokens/day on the 70B model, about a fifth of one city. Avoid models below ~30B; structured extraction degrades sharply |
+| Cerebras | `https://api.cerebras.ai/v1` | 1M tokens/day free, but needs a verified payment method and caps free context at 8k — below `GRAPHITI_MAX_TOKENS` alone, so Graphiti fails |
+| OpenAI | `https://api.openai.com/v1` | Paid |
+| Ollama (self-hosted) | `http://host.docker.internal:11434/v1` | Unmetered, no key. Same size caveat as Groq |
+
+**Not wired up, but the obvious next move:** Mistral's Batch API is 50%
+cheaper *and* exempt from rate limits, which would remove the only real
+constraint on the free plan. It needs a submit-and-poll rewrite of
+`app/llm/client.py` rather than a config change, so it is out of scope here —
+but the job registry added in §4.1 is already the right shape to hang it on.
+
+`scripts/check_services.py` calls **both** models, because they fail
+independently: a retired id in `LLM_BULK_MODEL` produces a run with no claims
+and an empty graph while the judgement model answers fine.
 
 Four settings cause confusing failures if ignored. The first two are the ones
 that break a provider switch outright:
 
-- **`LLM_REASONING_EFFORT`** must be **empty** on providers that do not
-  implement it — which includes the default. An OpenAI-compatible shim
-  *rejects* a parameter it does not support rather than ignoring it, so a
-  stray value fails every call with an opaque 400. Set it to `low` only on a
-  thinking model (Gemini 3, OpenAI o-series), where thinking tokens otherwise
-  come out of the answer's budget and a long extraction prompt returns `""`.
+- **`LLM_REASONING_EFFORT`** must be **empty** on a model that does not
+  implement it — which includes the default, `mistral-large-latest`. An
+  OpenAI-compatible shim *rejects* a parameter it does not support rather than
+  ignoring it, so a stray value fails every call with an opaque 400. The two
+  effort settings therefore differ by *model*, not by role: Mistral Small 4 is
+  a hybrid reasoning model and takes `none`, Large 3 takes nothing. On a
+  thinking model (Gemini 3, OpenAI o-series) set it low rather than empty, or
+  thinking tokens come out of the answer's budget and a long extraction prompt
+  returns `""`.
+  Do **not** set `high` on Mistral Small 4 expecting better claims: at `high`
+  it returns `message.content` as a list of thinking-and-text chunks rather
+  than a string. `app/llm/client._answer_text` now unwraps that, but every
+  other consumer of a raw OpenAI response would not.
 - **`GRAPHITI_SEMAPHORE_LIMIT`** bounds Graphiti's *own* concurrency, which
   `LLM_MAX_CONCURRENCY` does not govern. `graphiti-core` reads `SEMAPHORE_LIMIT`
   once at module scope and defaults to **20**. Graphiti is the largest consumer
   of calls in a run, so leaving it at 20 against a per-second limit puts the
   retry storm exactly where it hurts most. This is the setting people miss.
 - **`LLM_MAX_CONCURRENCY`** bounds our thread pool during extraction and
-  fact-checking. Keep it at or below the provider's requests-per-second
-  allowance — **1** for Mistral's free plan, **8** on a per-day provider for
-  roughly 8× the speed. Retry with exponential backoff is built in, but a
-  throttled run spends its time waiting rather than working.
+  fact-checking. Keep it at or below the provider's request-rate allowance —
+  **1** for Mistral's free plan (the default), **4–8** on a paid key or a
+  per-day provider for roughly that much more speed. Retry with exponential
+  backoff is built in, but a throttled run spends its time waiting rather than
+  working, and bursts of retries are what a rate limiter punishes hardest.
 - **`GRAPHITI_MAX_TOKENS`** needs headroom because Graphiti has no
   reasoning-effort knob. Too low shows up as a graph with no fact edges rather
   than as an error.
@@ -339,6 +422,75 @@ budget a minute and outbound HTTPS access.
 Tavily and the sites being researched, plus **TCP 7687** to the Neo4j Sandbox —
 that last one is the rule people forget on locked-down VPCs.
 
+### 4.1 Railway (or any Dockerfile-reading PaaS)
+
+Railway builds the [`Dockerfile`](../Dockerfile) directly and needs **no extra
+services for the datastores**. That is the whole point of §1: SQLite and Milvus
+Lite are libraries writing files, not servers, so the `docker-compose.yml`
+topology collapses to a single Railway service plus a volume. Do **not** port
+`docker-compose.milvus.yml` across — that would mean three more Railway
+services (etcd, MinIO, milvus) and ~3 GB of RAM to get identical query results.
+
+1. **Volume.** Attach one at mount path `/app/data`. Without it the SQLite file
+   and the Milvus Lite database are recreated empty on every deploy, so every
+   researched city is lost on the next push. Free and Trial plans cap volumes
+   at 0.5 GB; Hobby gives 5 GB, which is the realistic floor here because the
+   passage embeddings grow per city.
+2. **Variables.** Everything from `.env.example` goes in the service variables
+   — there is no `.env` file in the image, and `load_dotenv()` simply finds
+   nothing and falls through to the real environment. The three that pin
+   storage to the volume:
+
+   ```bash
+   DATA_DIR=/app/data
+   DATABASE_URL=sqlite:////app/data/cardio4cities.db   # four slashes = absolute
+   MILVUS_URI=/app/data/milvus.db
+   ```
+
+   Plus `LLM_API_KEY`, `NEO4J_URI` and `NEO4J_PASSWORD`, exactly as on a VM.
+3. **Port.** Railway injects `PORT` and routes to it. The image defaults
+   `PORT=8000` and the start command expands it, so this works either way —
+   but a hardcoded `--port 8000` is the usual cause of a service that builds
+   green and then never answers.
+4. **Healthcheck.** Railway ignores the Docker `HEALTHCHECK` instruction and
+   uses its own; [`railway.json`](../railway.json) points it at `/health` with
+   a 300 s timeout to cover image start-up.
+
+Three things behave differently here than on a VM:
+
+- **Redeploys are not zero-downtime.** A service with a volume cannot run two
+  active deployments against it, so every push has a short gap. This is a
+  feature, not a limit to work around: SQLite's single-writer lock and Milvus
+  Lite's file lock both assume exactly one process.
+- **Replicas are unavailable** with a volume attached, and `numReplicas` is
+  pinned to 1 for that reason. Scaling out means moving off both embedded
+  stores — Railway Postgres (see §3.2) and Zilliz Cloud (§3.3 option C) — at
+  which point the volume can go away entirely.
+- **Sleeping is fatal to a demo.** `PREWARM_EMBEDDINGS=true` (the default)
+  loads the model during startup rather than on the first request, so a warm
+  service answers immediately — but a service that has been asleep pays the
+  whole cold start, container plus model, while someone is watching. Keep it
+  always-on.
+
+**What no longer applies here, and why it is worth knowing.** Railway closes an
+HTTP request after **5 minutes with no bytes transferred** and caps even a
+chatty one at **15 minutes**. That used to make this host unusable for a real
+run, because `POST /research` held the request open for the full 10–20 minutes
+and then returned the brief: the browser got a 502 while the container quietly
+finished the work, and the deliverable existed but was unreachable. `/research`
+now registers a job and returns an id in milliseconds, so no request is ever
+long enough for a proxy deadline to apply — on Railway, behind nginx, or
+through a corporate proxy. See [`app/jobs.py`](../app/jobs.py) and §6.
+
+**Railway Postgres**, if you want it instead of SQLite: the injected
+`DATABASE_URL` is `postgresql://…`, which SQLAlchemy 2.0 resolves to psycopg2 —
+not in `requirements.txt`. Add `psycopg2-binary` before switching, or the first
+store construction fails with `ModuleNotFoundError: psycopg2`.
+
+Render and Fly.io differ only in the names: a persistent disk mounted at
+`/app/data`, the same three storage variables, and the same request-duration
+question to check before trusting a live `/research` call.
+
 ---
 
 ## 5. Running without Docker
@@ -372,11 +524,31 @@ dependency:
 
 ```bash
 curl http://<host>/health                       # app up; per-store reachability
-docker compose exec app python -m scripts.check_services   # LLM, Neo4j, Milvus, search
-curl -X POST http://<host>/research \
-     -H 'Content-Type: application/json' \
-     -d '{"city":"Pune","country":"India"}'     # end-to-end, ~1-3 min
+docker compose exec app python -m scripts.check_services   # both models, Neo4j, Milvus, search
+
+# Research returns a job id immediately; poll it for progress and the brief.
+JOB=$(curl -sX POST http://<host>/research \
+       -H 'Content-Type: application/json' \
+       -d '{"city":"Pune","country":"India"}' | jq -r .job_id)
+
+# `wait` holds the response open until the job finishes, up to 60s, so this
+# loop costs one request a minute rather than one a second.
+#
+# Test for the TERMINAL states, not for "running": a job is `queued` until a
+# slot frees up, so `while status = running` falls straight through on a busy
+# server and the curl below prints a job with no result in it.
+while :; do
+  STATUS=$(curl -s "http://<host>/research/$JOB?wait=60" | jq -r .status)
+  case "$STATUS" in succeeded|failed|cancelled) break ;; esac
+done
+curl -s "http://<host>/research/$JOB" | jq '.llm_usage, .result.counts'
 ```
+
+`llm_usage` is worth reading on the first run of a new provider or model: it
+reports calls and tokens **per model**, which is the only way to confirm the
+bulk calls are actually going to `LLM_BULK_MODEL`. A run showing all ~150 calls
+against `LLM_MODEL` means the split is misconfigured and the bill is roughly
+six times what it should be.
 
 **Persistence.** Everything durable lives in the `app-data` volume and in the
 Neo4j Sandbox. `docker compose down` keeps the volume; `docker compose down -v`
@@ -402,7 +574,10 @@ of degraded modes is in
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `POST /research` appears to hang — nothing logged after `GET /cities` | Normally not a hang: a thorough run is 10–20 minutes and uvicorn only logs a request once it *completes*. `LOG_LEVEL=INFO` now prints each node with its duration | Watch the node log. If `graph_writer` is the slow one that is expected — Graphiti re-extracts entities for every fact. Use the demo profile in `.env.example` §Cost |
+| `POST /research` returns immediately with no brief | Working as designed — it returns a `job_id`, because a 10–20 minute request does not survive any proxy in the path. Poll `GET /research/{job_id}` | Nothing to fix. `GET /research` lists recent jobs if you lost the id |
+| A run is slow and you want to know where | `GET /research/{job_id}` reports every node's state, elapsed seconds and what it produced — the same measurement the log prints | If `graph_writer` is the slow one that is expected: Graphiti re-extracts entities for every fact. Raise `GRAPH_WRITE_CONCURRENCY`, or use the demo profile in `.env.example` §Cost |
+| A job disappeared with a 404 | Finished jobs are kept for `JOB_RETENTION_SECONDS` (1h), and a restart forgets in-flight ones | The brief is stored permanently — `GET /report/{city}`. Only the progress detail expires |
+| `llm_usage` shows every call against one model | The two-model split is misconfigured — `LLM_BULK_MODEL` is unset or equal to `LLM_MODEL` | Set both. On the Mistral defaults this is roughly a 3x difference in the bill for identical JSON |
 | The very first run is slow before any node finishes | `sentence-transformers` downloads `all-MiniLM-L6-v2` (~90 MB) lazily on the first embed | One-off. It is cached afterwards; pre-warm with `python -c "from app.llm import embeddings; embeddings.get_model()"` |
 | `/health` reports `graph: unreachable`; `/graph/{city}` returns 503 | Sandbox expired or was restarted | Re-copy **both** the Bolt URI and the password from sandbox.neo4j.com |
 | Research completes but the brief is nearly all Gaps | LLM returning empty or malformed output | Check `LLM_API_KEY`; raise `LLM_MAX_TOKENS`. On a *thinking* model also set `LLM_REASONING_EFFORT=low`, since thinking tokens can consume the whole answer budget |
@@ -411,10 +586,13 @@ of degraded modes is in
 | `XMLParsedAsHTMLWarning: It looks like you're using an HTML parser to parse an XML document` | An RSS/Atom feed or sitemap served as `text/xml`, which the old substring content-type check let through to the HTML parser | Fixed: content types are matched exactly and XML gets `lxml-xml`. If it still appears, a server is mislabelling XML as `text/html` — the warning is then correct and worth reading, which is why it is **not** filtered |
 | Warnings saying *"unsupported content type"* | Working as designed. PDFs, CSVs and JSON are refused rather than fed to the model as prose | Nothing to fix. Many government portals publish as PDF; supporting them is future work, not a failure |
 | Warnings saying *"only N characters of readable text"* | The page parsed but is essentially empty — a JS-rendered shell, a login wall, or a redirect stub | Nothing to fix. Dropping it saves a model call that could only have returned nothing |
-| 429 with `'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'` and `'quotaValue': '20'` | A Gemini 3.x **preview** model is selected. Those allow 20 requests/day; one city needs 150–250 | Switch to a provider metered per *second* rather than per *day* — see the table in `.env.example`. The shipped default (Mistral Small, free Experiment plan) is ~1 RPS with 1B tokens/month |
-| Every LLM call fails with an opaque 400 right after switching provider | `LLM_REASONING_EFFORT` is set on a provider that doesn't implement it. Unimplemented parameters are **rejected**, not ignored | Clear `LLM_REASONING_EFFORT` in `.env`. Only set it on thinking models (Gemini 3, OpenAI o-series) |
+| 429 with `'quotaId': 'GenerateRequestsPerDayPerProjectPerModel-FreeTier'` and `'quotaValue': '20'` | A Gemini **free-tier** key. `gemini-3.5-flash` allows 20 requests/day; one city needs 150–250 | Switch to Mistral (the default), whose free plan is throttled on rate but gives 1B tokens/month, or link Gemini billing. `RUN_MODE=MOCK` needs no key at all |
+| Every LLM call fails with an opaque 400 right after switching provider | A reasoning-effort setting is populated for a model that doesn't implement it. Unimplemented parameters are **rejected**, not ignored | Clear the setting for *that role*. The two are separate because `mistral-small-latest` takes `none` while `mistral-large-latest` takes nothing at all |
+| Claims and search queries come back empty on a model that is definitely answering | A reasoning model returned `message.content` as a list of thinking/text chunks rather than a string, so `json.loads` saw nothing usable. Happens on `mistral-small-latest` at `reasoning_effort=high` | Use `none`. `app/llm/client._answer_text` unwraps the chunk list defensively, so this should not reach you — if it does, a provider is using a chunk shape it does not describe |
 | 401 / "API key not valid" right after switching provider | Keys are per-provider; the base URL changed but the key didn't | Issue a key from the provider that owns `LLM_BASE_URL`. `check_services.py` now says this explicitly |
-| Constant 429s and `Retrying _generate_response_with_retry after N attempts` | Concurrency exceeds the provider's requests-per-second allowance. Graphiti is the biggest caller and has its **own** limit | Set `LLM_MAX_CONCURRENCY=1` **and** `GRAPHITI_SEMAPHORE_LIMIT=1`. The second one is the one people miss — `graphiti-core` defaults to 20 concurrent calls |
+| Mistral returns `429 Rate limit exceeded` (code 1300) on the **very first** call, and waiting does not help | Not a throttle. Check the response header `x-ratelimit-limit-req-minute` — if it reads **`0`**, the account has no completions allowance at all. The key authenticates, which is why this presents as 429 rather than 401 | Activate the free Experiment plan in the Mistral Admin Console (phone verification, no card), or check whether the Organization/Workspace monthly spending limit is set to zero. No code change will fix it |
+| Mistral returns `403 tier_not_allowed` (code 1910) for `mistral-large-latest` | Large 3 is **not served on the free tier**. It is also absent from `GET /v1/models` for a free key | Use `mistral-medium-latest` (the default). List what your key can actually reach with `curl https://api.mistral.ai/v1/models -H "Authorization: Bearer $LLM_API_KEY"` |
+| Constant 429s and `Retrying _generate_response_with_retry after N attempts` | Concurrency exceeds the provider's allowance. Graphiti is the biggest caller and has its **own** limit | Set `LLM_MAX_CONCURRENCY=1` **and** `GRAPHITI_SEMAPHORE_LIMIT=1`. The second one is the one people miss — `graphiti-core` defaults to 20 concurrent calls. `llm_usage.failures` on the job counts the retries |
 | Quota exhausts partway, then the brief fills with off-topic sources | Query planning fell back to keyword templates once the LLM stopped answering, so searches went generic. Cascade, not a search bug | Fix the quota first, then re-run. The irrelevant URLs are a symptom |
 | Brief warns *"Query planning fell back to keyword templates"* | The LLM was unreachable on that pass | Working as designed — the run continued on generic searches. Check the provider and the key |
 | Brief is entirely Gaps citing *"Search returned no candidate sources"* | No outbound internet, or the search provider is blocked | **Read the Run Warnings first** — a provider failure now names itself and the exception type there. Silence means search really did return nothing |
@@ -427,12 +605,12 @@ of degraded modes is in
 | Brief warns *"Skipped official statistics: ... no country was supplied"* | WHO GHO and the World Bank are keyed by country | Send `country` in the request body — the UI form has the field |
 | Brief warns *"publishes no usable {code} value"* | That indicator has been archived, or has no rows for this country | Working as designed; the dimension still has its other indicators and the web path. Replace the code in `official_data_agent.py` if it is permanent |
 | No WHO or World Bank facts at all, no warning either | `ENABLE_OFFICIAL_DATA` is false, or neither served dimension was in focus | Check `.env`; the path only runs for `cv_burden` and `health_system` |
-| Run is very slow, logs show retries | Provider rate limiting | Lower `LLM_MAX_CONCURRENCY` to 2–3 |
+| Run is very slow, logs show retries | Provider rate limiting | Lower `LLM_MAX_CONCURRENCY` to 2–3. Note this does **not** throttle the crawler any more — that is `HTTP_MAX_CONCURRENCY`, which costs no tokens |
 | `DataNotMatchException: {id} field should be a int64` | A `city_passages` collection from an earlier build has an Int64 primary key; passage ids are URL hashes | Fixed automatically now — the store validates the schema on init and recreates a mismatched collection. If you are on older code, delete `./data/milvus.db` |
 | Startup logs *"Milvus collection ... is unusable"* | The self-repair above just ran | Informational. Passage embeddings for already-researched cities were dropped and rebuild on the next run for those cities |
 | `FutureWarning: get_sentence_embedding_dimension ... renamed` | sentence-transformers 5.x renamed the method | Fixed; `embedding_dim()` now prefers `get_embedding_dimension` and falls back |
 | Log floods with *"Retrying _generate_response_with_retry"* | Graphiti's own entity extraction is being rate-limited | **This is the LLM provider, not Neo4j.** Graphiti runs several model calls per fact, so it is usually the largest LLM consumer and first to hit a free-tier quota. Check the Run Warnings for the fact-level count |
 | `ModuleNotFoundError: milvus_lite` | Native Windows | Run in Docker or WSL2, or point `MILVUS_URI` at a server |
-| First request hangs ~60s | Embedding model loading | Expected once per container start; the healthcheck's 40s start period covers it |
+| First request hangs ~60s | Embedding model loading, which now happens at startup instead | Set `PREWARM_EMBEDDINGS=true` (the default). With it off, this is expected once per container start |
 | Many sources DENIED | robots.txt or the ToS denylist | Working as intended — `/sources/{city}` lists each URL with its reason |
 | Container restart loop | Bad `.env` | `docker compose logs app`; stores are constructed lazily, so this is nearly always a parse error in `.env` itself |

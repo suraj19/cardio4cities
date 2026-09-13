@@ -2,15 +2,23 @@
 FastAPI app exposing the research pipeline and the intelligence asset it
 builds.
 
-  POST /research            run the full LangGraph pipeline for a city
-  POST /ask                 grounded, cited answer over vector + graph
-  GET  /cities              cities already researched (the reusable asset)
-  GET  /report/{city}       the stored brief as JSON
-  GET  /report/{city}/download   the brief as a downloadable .md file
-  GET  /sources/{city}      every URL considered + the crawl gate's verdict
-  GET  /facts/{city}        fact audit trail: tier, reasoning, provenance
-  GET  /graph/{city}        knowledge-graph facts with temporal validity
-  GET  /health              liveness check
+  POST   /research            start a research job; returns an id to poll
+  GET    /research/{job_id}   job status, per-node progress, brief when done
+  DELETE /research/{job_id}   cancel an in-flight job
+  GET    /research            recent jobs
+  POST   /ask                 grounded, cited answer over vector + graph
+  GET    /cities              cities already researched (the reusable asset)
+  GET    /report/{city}       the stored brief as JSON
+  GET    /report/{city}/download   the brief as a downloadable .md file
+  GET    /sources/{city}      every URL considered + the crawl gate's verdict
+  GET    /facts/{city}        fact audit trail: tier, reasoning, provenance
+  GET    /graph/{city}        knowledge-graph facts with temporal validity
+  GET    /health              liveness check
+
+Research is the only asynchronous endpoint, and it has to be: a run is
+minutes long, and holding an HTTP request open across that means betting the
+deliverable on a proxy that will not wait — see app/jobs.py for the specific
+deadlines. Everything else answers from a store and returns immediately.
 
 The read endpoints exist so that "where did this come from?" is answerable
 from outside the run that produced the answer. A report returned only in
@@ -19,6 +27,8 @@ rather than of the system.
 """
 import asyncio
 import logging
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -28,9 +38,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.graph.workflow import WORKFLOW_CONFIG, workflow
+from app.jobs import TERMINAL_STATES, registry
 from app.llm.client import llm_client
-from app.models.schemas import ConfidenceTier, CrawlVerdict, ResearchRequest, dimension_label
+from app.models.schemas import ResearchRequest, dimension_label
 from app.stores.graph_store import graph_store
 from app.stores.relational_store import relational_store
 from app.stores.vector_store import vector_store
@@ -47,7 +57,47 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-app = FastAPI(title="CARDIO4Cities City Intelligence")
+logger = logging.getLogger(__name__)
+
+
+def _prewarm_embeddings() -> None:
+    """Load the sentence-transformers model before anyone asks for it.
+
+    ~60s on a cold container, and it used to land on the first request that
+    touched the vector store or the graph — which during a demo reads as the
+    app having hung, and on a host with an HTTP deadline can consume the whole
+    request budget before any work starts. Doing it at startup moves that cost
+    somewhere nobody is waiting.
+
+    In a thread rather than awaited, because the healthcheck has to start
+    answering immediately: a platform that probes `/health` during startup and
+    gets no response will conclude the deploy failed and roll it back.
+    """
+    try:
+        from app.llm import embeddings
+
+        embeddings.get_model()
+        logger.info("Embedding model %s loaded.", settings.EMBEDDING_MODEL)
+    except Exception as exc:
+        # Not fatal. The model is loaded lazily anyway, so the only loss is
+        # the head start — and an image built without the model baked in can
+        # legitimately fail here with no network.
+        logger.warning(
+            "Could not pre-load the embedding model (%s: %s). It will load on "
+            "first use instead.", type(exc).__name__, exc,
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.PREWARM_EMBEDDINGS and not settings.is_mock:
+        threading.Thread(
+            target=_prewarm_embeddings, name="prewarm-embeddings", daemon=True
+        ).start()
+    yield
+
+
+app = FastAPI(title="CARDIO4Cities City Intelligence", lifespan=lifespan)
 
 # The UI is served from this same app in deployment, so CORS is not needed for
 # the normal path. It stays permissive so the page also works when opened
@@ -88,44 +138,91 @@ def health():
     return {"status": "ok", "run_mode": settings.RUN_MODE}
 
 
-@app.post("/research")
-async def research(req: ResearchRequest):
+@app.post("/research", status_code=202)
+async def start_research(req: ResearchRequest, response: Response):
+    """Register a research job and return immediately.
+
+    202 rather than 200, because nothing has been researched yet — the body
+    is a receipt, not a result. Poll `GET /research/{job_id}` for progress and
+    for the brief.
+
+    A second request for a city already being researched returns the job
+    already running instead of starting another. Two concurrent passes over
+    one city would write the same facts twice and spend the overlap
+    contending for the SQLite write lock, and the usual way to trigger it is
+    a double-click on Run.
+    """
     city = _clean_city(req.city)
-    final_state = await workflow.ainvoke(
-        {"city": city, "country": req.country, "retry_count": 0},
-        config=WORKFLOW_CONFIG,
-    )
 
-    fact_checked = final_state.get("fact_checked", [])
-    crawl_results = final_state.get("crawl_results", [])
+    # The check and the insert happen together inside `submit`, under one
+    # lock. Doing it here in two awaits left a window in which two clicks
+    # could both start a run.
+    job, created = await registry.submit(city, req.country)
+    response.headers["Location"] = f"/research/{job.job_id}"
+    payload = job.as_dict(include_result=False)
+    if not created:
+        payload["note"] = f"A research job for '{city}' is already {job.state}."
+    return payload
 
-    def tier_count(tier: ConfidenceTier) -> int:
-        return sum(1 for f in fact_checked if f.tier == tier)
 
-    return {
-        "city": city,
-        "dimensions": final_state.get("dimensions", []),
-        "covered_dimensions": final_state.get("covered_dimensions", []),
-        "uncovered_dimensions": final_state.get("uncovered_dimensions", []),
-        "research_passes": final_state.get("retry_count", 0) + 1,
-        "report_markdown": final_state.get("report_markdown"),
-        "warnings": final_state.get("warnings", []),
-        "counts": {
-            "candidates_considered": len(crawl_results),
-            "sources_allowed": sum(
-                1 for r in crawl_results if r.verdict == CrawlVerdict.ALLOWED
-            ),
-            "sources_denied": sum(
-                1 for r in crawl_results if r.verdict == CrawlVerdict.DENIED
-            ),
-            "sources_read": len(final_state.get("passages", [])),
-            "verified_facts": tier_count(ConfidenceTier.VERIFIED),
-            "single_source_facts": tier_count(ConfidenceTier.SINGLE_SOURCE),
-            "conflicting_facts": tier_count(ConfidenceTier.CONFLICTING),
-            "unsupported_claims": tier_count(ConfidenceTier.UNSUPPORTED),
-            "gaps": len(final_state.get("gaps", [])),
-        },
-    }
+@app.get("/research")
+async def list_research():
+    """Recent jobs, newest first. Results are omitted — a brief is large and
+    this is a list view; fetch the individual job for the report."""
+    return {"jobs": await registry.list_jobs()}
+
+
+@app.get("/research/{job_id}")
+async def get_research(
+    job_id: str,
+    wait: int = Query(
+        0,
+        ge=0,
+        le=60,
+        description="Seconds to hold the response open waiting for the job to "
+        "finish. 0 returns the current state immediately.",
+    ),
+):
+    """Job status, per-node progress, and the brief once it exists.
+
+    `wait` makes this a bounded long-poll, which exists for scripts and the
+    `curl` examples in the docs: without it, a shell caller has to implement
+    a sleep loop to do the obvious thing. It is capped at 60 seconds — well
+    inside every proxy deadline named in app/jobs.py — so a caller that wants
+    to block for the whole run still has to loop, but loops once a minute
+    instead of once a second.
+    """
+    job = await registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No job '{job_id}'. Finished jobs are kept for "
+            f"{settings.JOB_RETENTION_SECONDS}s; the brief itself is stored "
+            f"permanently, so try GET /report/{{city}}.",
+        )
+
+    deadline = asyncio.get_running_loop().time() + wait
+    while job.state not in TERMINAL_STATES:
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.5)
+
+    return job.as_dict()
+
+
+@app.delete("/research/{job_id}")
+async def cancel_research(job_id: str):
+    """Cancel an in-flight job.
+
+    Stops the pipeline between nodes rather than mid-node: work already
+    handed to a thread pool runs to completion, and anything a node persisted
+    before the cancel stays persisted. That is deliberate — a half-written
+    audit trail is still a true record of what was read.
+    """
+    job = await registry.cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No job '{job_id}'.")
+    return job.as_dict(include_result=False)
 
 
 @app.get("/cities")

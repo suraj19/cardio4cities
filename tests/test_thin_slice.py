@@ -12,7 +12,10 @@ This requires RUN_MODE=MOCK (the default) and needs NO internet access,
 NO API keys, and NO running Neo4j instance.
 """
 import os
-os.environ.setdefault("RUN_MODE", "MOCK")
+
+# Assigned, not setdefault: an inherited RUN_MODE=LIVE would take this suite
+# to the real internet and hang there. See tests/test_jobs.py.
+os.environ["RUN_MODE"] = "MOCK"
 
 import pytest
 from app.graph.workflow import workflow
@@ -24,8 +27,12 @@ async def test_thin_slice_end_to_end():
     initial_state = {"city": "Testopolis", "retry_count": 0}
     final_state = await workflow.ainvoke(initial_state)
 
-    # --- Orchestration ran the dimension we expect ---
-    assert final_state["dimension"] == "healthcare_programmes"
+    # --- Orchestration planned the dimension we expect ---
+    # Plural: a run researches five dimensions and the planner records them
+    # all. The singular `dimension` this once read belonged to the earlier
+    # single-dimension design and is no longer a field on the state, so the
+    # assertion was raising KeyError rather than checking anything.
+    assert "healthcare_programmes" in final_state["dimensions"]
 
     # --- Crawlability gate produced a mix of verdicts (not all-allow) ---
     crawl_results = final_state["crawl_results"]
@@ -57,9 +64,15 @@ async def test_thin_slice_end_to_end():
     )
 
     # --- Report was generated and contains evidence + gap sections ---
+    # The brief groups findings by dimension and reports confidence in its own
+    # section, so the old "Verified Facts" / "Single-Source Facts" headings no
+    # longer exist. What matters is unchanged and is what these assert: the
+    # brief distinguishes corroborated facts from single-sourced ones rather
+    # than presenting everything as equally certain.
     report = final_state["report_markdown"]
-    assert "Verified Facts" in report
-    assert "Single-Source Facts" in report
+    assert "## Confidence Summary" in report
+    assert "**Verified**" in report
+    assert "**Single source**" in report
     assert "Gaps & Uncertainties" in report
     assert "Source Coverage" in report
 

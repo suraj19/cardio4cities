@@ -11,9 +11,19 @@ told which dimension the source was found for and which city is the
 subject — the latter is what lets it set is_city_level=false when a page
 about the country is being read for signal about the city.
 
-Fetch and extraction run together on a thread pool, one task per URL.
-They are independent and both dominated by waiting, so doing them
-serially made a twenty-source run take minutes.
+The two halves run on separate thread pools, sized separately, because they
+are limited by different things. Fetching is pure network wait and costs
+nothing; extraction is one model call per source and is bounded by the
+provider's rate limit. Running both on one pool sized for the LLM meant that
+setting LLM_MAX_CONCURRENCY=1 — which is the correct value for a
+per-second-metered provider — also fetched twenty pages one at a time.
+
+Extraction is the run's largest single *input* payload: one call per source,
+and the prompt is the page. It therefore goes to the bulk model profile (see
+app/llm/client.py) and is shown a dimension-relevant window of the page
+rather than its first N characters — the two changes that between them cut
+this node's token cost by roughly half without touching what is stored for
+`/ask`, which still gets the full passage.
 """
 from __future__ import annotations
 
@@ -32,7 +42,7 @@ from app.models.schemas import (
     ExtractedPassage,
     SourceCandidate,
 )
-from app.util import domain_of
+from app.util import domain_of, relevant_window, tokens
 
 CLAIM_EXTRACTION_SYSTEM = """You extract atomic factual claims from a passage
 about a city, for a public-health research brief.
@@ -176,39 +186,69 @@ def _claim_id(url: str, index: int) -> str:
     return f"{domain_of(url)}-{hashlib.sha1(url.encode()).hexdigest()[:8]}-{index}"
 
 
-def _process_source(candidate: SourceCandidate, city: str) -> tuple[ExtractedPassage | None, list[Claim], str | None]:
+def _fetch_source(
+    candidate: SourceCandidate,
+) -> tuple[ExtractedPassage | None, str | None]:
+    """Read one allowed URL. No model call, so this runs on the HTTP pool."""
     url = candidate.url
     try:
         text = _mock_fetch(url) if settings.is_mock else _real_fetch(url)
     except Exception as exc:
         # A failed fetch is not a fabricated fact. Record why, drop the source.
-        return None, [], f"Could not read {url}: {type(exc).__name__}: {exc}"
+        return None, f"Could not read {url}: {type(exc).__name__}: {exc}"
 
     if not text.strip():
-        return None, [], f"Could not read {url}: page had no extractable text."
+        return None, f"Could not read {url}: page had no extractable text."
 
-    passage = ExtractedPassage(
-        url=url,
-        domain=domain_of(url),
-        title=candidate.title or url,
-        text=text,
-        dimension=candidate.dimension,
+    return (
+        ExtractedPassage(
+            url=url,
+            domain=domain_of(url),
+            title=candidate.title or url,
+            text=text,
+            dimension=candidate.dimension,
+        ),
+        None,
     )
 
-    brief = DIMENSION_BRIEFS.get(candidate.dimension, candidate.dimension)
+
+def _focused_window(passage: ExtractedPassage, city: str) -> str:
+    """The part of the page worth paying to extract from.
+
+    Scored against the dimension brief and the city name, which together are
+    exactly what the extractor is being asked to find — so this is not a
+    generic summarisation step, it is the same question asked of the text
+    before the model sees it.
+
+    Returns the whole passage when it already fits, so short pages are
+    unaffected and the mock fixtures stay byte-identical.
+    """
+    brief = DIMENSION_BRIEFS.get(passage.dimension, passage.dimension)
+    wanted = tokens(f"{city} {brief}")
+    return relevant_window(passage.text, wanted, settings.EXTRACTION_CHAR_LIMIT)
+
+
+def _extract_claims(
+    passage: ExtractedPassage, city: str
+) -> tuple[list[Claim], str | None]:
+    """One model call against one passage."""
+    url = passage.url
+    brief = DIMENSION_BRIEFS.get(passage.dimension, passage.dimension)
     user_prompt = (
         f"City under research: {city}\n"
         f"Dimension of interest: {brief}\n"
-        f"Source: {candidate.title or url} ({domain_of(url)})\n\n"
-        f"Passage:\n{text}"
+        f"Source: {passage.title} ({passage.domain})\n\n"
+        f"Passage:\n{_focused_window(passage, city)}"
     )
 
     try:
-        raw = llm_client.complete(CLAIM_EXTRACTION_SYSTEM, user_prompt)
+        # bulk: this fills a two-field schema from text it has been handed.
+        # There is no judgement in it, and it is 20 of the run's calls.
+        raw = llm_client.complete(CLAIM_EXTRACTION_SYSTEM, user_prompt, bulk=True)
     except Exception as exc:
         # The passage was read successfully, so keep it — it is still indexed
         # for semantic search — but produce no claims and say why.
-        return passage, [], f"Could not extract claims from {url}: {type(exc).__name__}: {exc}"
+        return [], f"Could not extract claims from {url}: {type(exc).__name__}: {exc}"
 
     claims: list[Claim] = []
     for index, item in enumerate(parse_json_list(raw)):
@@ -222,15 +262,15 @@ def _process_source(candidate: SourceCandidate, city: str) -> tuple[ExtractedPas
                 claim_id=_claim_id(url, index),
                 text=claim_text,
                 source_url=url,
-                source_domain=domain_of(url),
+                source_domain=passage.domain,
                 is_city_level=bool(item.get("is_city_level", True)),
-                dimension=candidate.dimension,
+                dimension=passage.dimension,
             )
         )
         if len(claims) >= settings.MAX_CLAIMS_PER_PASSAGE:
             break
 
-    return passage, claims, None
+    return claims, None
 
 
 def extraction_node(state: CityResearchState) -> dict:
@@ -278,18 +318,35 @@ def extraction_node(state: CityResearchState) -> dict:
                 ],
             }
 
-    with ThreadPoolExecutor(max_workers=settings.LLM_MAX_CONCURRENCY) as pool:
-        outcomes = list(pool.map(lambda c: _process_source(c, city), todo))
+    warnings: list[str] = []
+
+    # Phase 1: fetch. Network-bound, no tokens, so sized by HTTP_MAX_CONCURRENCY.
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(settings.HTTP_MAX_CONCURRENCY, len(todo)))
+    ) as pool:
+        fetched = list(pool.map(_fetch_source, todo))
 
     passages: list[ExtractedPassage] = []
-    claims: list[Claim] = []
-    warnings: list[str] = []
-    for passage, source_claims, warning in outcomes:
+    for passage, warning in fetched:
         if passage:
             passages.append(passage)
-        claims.extend(source_claims)
         if warning:
             warnings.append(warning)
+
+    # Phase 2: extract. One model call per passage that was actually read, so
+    # sized by the provider's rate limit. Splitting the phases also means a
+    # slow site no longer occupies a slot that a model call is waiting for.
+    claims: list[Claim] = []
+    if passages:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(settings.LLM_MAX_CONCURRENCY, len(passages)))
+        ) as pool:
+            extracted = list(pool.map(lambda p: _extract_claims(p, city), passages))
+
+        for source_claims, warning in extracted:
+            claims.extend(source_claims)
+            if warning:
+                warnings.append(warning)
 
     return {
         "passages": passages,

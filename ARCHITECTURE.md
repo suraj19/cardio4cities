@@ -24,7 +24,9 @@ produced it.
 
 | Endpoint | Invokes | Notes |
 |---|---|---|
-| `POST /research` | `workflow.ainvoke(...)` | Runs all ten nodes. Single blocking call. Returns the brief plus per-tier counts, coverage and any degradation warnings. |
+| `POST /research` | `jobs.registry.submit(...)` | Registers a background job and returns its id in milliseconds. A run is 10–20 minutes and every proxy in the path has a shorter deadline than that, so the request cannot be the thing that waits — see [`app/jobs.py`](app/jobs.py). |
+| `GET /research/{job_id}` | `jobs.registry.get(...)` | Per-node state, elapsed time and what each node produced, then the brief plus per-tier counts, coverage, degradation warnings and the run's per-model token cost. Drives the UI's stage checklist. |
+| `DELETE /research/{job_id}` | `jobs.registry.cancel(...)` | Stops the pipeline between nodes. Anything already persisted stays — a partial audit trail is still a true record of what was read. |
 | `POST /ask` | `vector_store.query` + `graph_store.query_facts_for_city` | Conversational retrieval over two stores, answered with inline citations, refused when the evidence does not support an answer. |
 | `GET /graph/{city}` | `graph_store.query_facts_for_city` | Reads Neo4j through Graphiti's hybrid search, with temporal validity per edge. |
 | `GET /report/{city}` · `/download` | `relational_store.get_report` | The stored brief as JSON, or as a downloadable `.md`. |
@@ -275,9 +277,13 @@ caps in `app/config.py` are the main answer to "what did you cut":
 | `FACT_CHECK_CONTEXT_PASSAGES` | 4 | rival passages shown per claim |
 | `FACT_CHECK_CONTEXT_CHARS` | 1500 | characters of each rival passage |
 | `FACT_CHECK_BATCH_SIZE` | 5 | claims sharing one adjudication call |
-| `PASSAGE_CHAR_LIMIT` | 5000 | characters kept per fetched page |
-| `LLM_MAX_CONCURRENCY` | 1 | parallel extraction / fact-check calls |
-| `GRAPHITI_SEMAPHORE_LIMIT` | 1 | Graphiti's own parallel extraction calls |
+| `PASSAGE_CHAR_LIMIT` | 5000 | characters **kept** per fetched page |
+| `EXTRACTION_CHAR_LIMIT` | 2500 | characters **sent** to the claim extractor |
+| `LLM_MAX_CONCURRENCY` | 4 | parallel extraction / fact-check calls |
+| `HTTP_MAX_CONCURRENCY` | 8 | parallel robots.txt, HEAD and page fetches |
+| `SEARCH_MAX_CONCURRENCY` | 3 | parallel search queries |
+| `GRAPH_WRITE_CONCURRENCY` | 1 | parallel Graphiti episode writes |
+| `GRAPHITI_SEMAPHORE_LIMIT` | 4 | Graphiti's own parallel extraction calls |
 | `MIN_DIMENSIONS_COVERED` | 3 | dimensions needed before the brief is written |
 | `MAX_PLANNER_RETRIES` | 2 | re-plan passes |
 
@@ -288,6 +294,27 @@ the same way, rather than taken from the front: head-truncation costs exactly
 the same tokens and routinely cut away the one sentence that would have settled
 the claim, because on a long report the relevant figure is rarely in the
 opening paragraph.
+
+That same selection is why `EXTRACTION_CHAR_LIMIT` can sit at half of
+`PASSAGE_CHAR_LIMIT`. Extraction is the run's largest single input payload —
+one call per source, and the prompt is the page — and the window sent is scored
+against the dimension brief, so the characters dropped are the masthead and the
+cookie notice rather than the programme description. The full passage is still
+stored and embedded, so `/ask` recall is unaffected.
+
+Three of these bound *concurrency* rather than volume, and they are separate
+numbers because they are limited by different things. `LLM_MAX_CONCURRENCY` is
+a quota; `HTTP_MAX_CONCURRENCY` is sockets; `SEARCH_MAX_CONCURRENCY` is what a
+consumer search engine tolerates before it rate-limits. They used to be one
+number, which meant the correct value for a per-second-metered LLM provider —
+1 — also fetched forty pages strictly one at a time.
+
+**Two models, by role.** `LLM_MODEL` serves the ~30 calls a run makes that are
+judgements; `LLM_BULK_MODEL` serves the ~120 that fill a fixed JSON schema from
+text in front of them, including all of Graphiti's entity extraction. On the
+Mistral defaults that is a ~3x price difference per token for output the reader
+cannot distinguish, and every finished job reports calls and tokens per model
+so the split is verifiable rather than assumed.
 
 **Where the tokens actually went.** Caps alone made the run bounded, not
 efficient. Measured against the defaults, one pass sends roughly 26k tokens of
@@ -355,11 +382,11 @@ fact, and nothing that fails silently.
 | `country` missing from the request | Official statistics are skipped with a warning saying why, since these APIs are keyed by country. The city research is unaffected | `official_data_agent.official_data_node` |
 | `robots.txt` unreachable | ALLOWED, because absence of a robots.txt is not a prohibition — but the reason string records that it was *"nobody said no"* rather than an explicit permission | `crawlability_agent._check_robots_txt` |
 | `X-Robots-Tag` HEAD request fails | Inconclusive; the robots.txt verdict stands | `crawlability_agent._check_noindex_header` |
-| One page fetch | Source dropped with a recorded warning, and the URL is recorded as *attempted* so later passes do not re-fetch a known-dead link and repeat its warning | `extraction_agent._process_source` |
+| One page fetch | Source dropped with a recorded warning, and the URL is recorded as *attempted* so later passes do not re-fetch a known-dead link and repeat its warning | `extraction_agent._fetch_source` |
 | The HTML parser is not installed | Checked once per pass, before any network work, and reported as a single warning naming the package and the `pip` command. Per-source this produced one identical warning per candidate, which read like a web outage | `extraction_agent._missing_parser_dependency` |
 | A source that is not readable prose (PDF, CSV, JSON, image) | Refused before parsing, by exact MIME type. Feeding bytes we cannot read to a model produces confident nonsense, which is worse than a gap | `extraction_agent._PARSER_FOR_TYPE` |
 | A source that parses to almost nothing | Dropped with the character count in the warning, rather than sent on. Extraction costs one model call per source, so an empty page would buy an empty answer at full price | `extraction_agent._real_fetch` |
-| Claim extraction call | Passage is still indexed for semantic search, but yields no claims, plus a warning | `extraction_agent._process_source` |
+| Claim extraction call | Passage is still indexed for semantic search, but yields no claims, plus a warning | `extraction_agent._extract_claims` |
 | Fact-check adjudication | Claim is forced to UNSUPPORTED — dropped rather than trusted — and therefore becomes a gap | `fact_check_agent._unadjudicated` |
 | A batched adjudication the model answers incompletely | Each unanswered claim is re-asked in its own call. Batching is an optimisation, so it is not allowed to cost a claim its verdict | `fact_check_agent._adjudicate_group` |
 | Query planning call | Falls back to keyword templates for every dimension, plus a warning. Generic searches beat no searches, and beat a 500 | `query_gen._plan_with_model` |
@@ -462,9 +489,18 @@ recall.
   nothing blocks on a human today. For a briefing tool where the reader is the
   domain expert, surfacing confidence beats gating on a reviewer who is the same
   person.
-- **No streaming progress.** `POST /research` blocks and the UI moves its stage
-  indicators as a group. Per-node streaming is a nicer demo and zero extra
-  trust; it was not worth the SSE plumbing inside the timebox.
+- **Progress is polled, not pushed.** A run reports each node's state, duration
+  and output, but the client asks for it every two seconds rather than being
+  told. Against a 10–20 minute run that interval is free, and it keeps the
+  progress path to one ordinary endpoint instead of a second transport that has
+  to survive the same proxies. SSE or a websocket is the upgrade if the
+  pipeline ever gets fast enough for two seconds to feel slow.
+- **Jobs are in-process, not a durable queue.** A job is a handle on a running
+  asyncio task, so a restart forgets the ones in flight. Finished work is
+  unaffected — the pipeline writes the brief, facts, sources and gaps to the
+  relational store as it goes, so `GET /report/{city}` answers with or without
+  the job. Celery or an outbox table is the change that horizontal scaling
+  forces, alongside moving off SQLite; neither is justified by one container.
 - **No PDF or non-HTML extraction.** Government portals publish a lot of PDFs
   and the extractor rejects them with a recorded warning rather than feeding
   their bytes to an LLM and getting confident nonsense. This is the single

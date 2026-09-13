@@ -53,6 +53,10 @@
   .stage.active .stage-dot{border-color:var(--teal);background:var(--teal);
     box-shadow:0 0 0 4px var(--teal-soft);}
   .stage.done .stage-dot{border-color:var(--verified);background:var(--verified);}
+  /* The stage a failed run died in. Without this the dot it was left on keeps
+     the `active` pulse for ever on a run that ended minutes ago. */
+  .stage.failed .stage-dot{border-color:var(--conflicting);
+    background:var(--conflicting);}
   .stage-name{font-weight:500;font-size:14px;color:var(--ink);}
   .stage.idle .stage-name{color:var(--ink-soft);}
   .stage-detail{margin-top:4px;font-family:'IBM Plex Mono',monospace;
@@ -168,6 +172,7 @@
       <input type="text" id="cityInput" placeholder="Enter any city, e.g. Pune">
       <input type="text" id="countryInput" placeholder="Country (recommended)">
       <button id="runBtn" onclick="runResearch()">Run research</button>
+      <button id="cancelBtn" class="ghost" onclick="cancelResearch()" hidden>Cancel</button>
     </div>
     <div class="asset-bar" id="assetBar"></div>
 
@@ -212,10 +217,14 @@
 const API_BASE = location.protocol.startsWith("http") ? "" : "http://localhost:8000";
 const API_LABEL = API_BASE || location.origin;
 
+// Ids are the workflow's node names, which is what GET /research/{job_id}
+// reports progress against — so a stage here maps to exactly one node and the
+// mapping needs no translation table.
 const STAGES = [
   {id:"planner", label:"Planner"},
   {id:"query_gen", label:"Query generation"},
   {id:"search", label:"Search / discovery"},
+  {id:"official_data", label:"Official statistics"},
   {id:"crawlability", label:"Crawlability gate"},
   {id:"extraction", label:"Extraction"},
   {id:"fact_check", label:"Fact-checking"},
@@ -224,7 +233,12 @@ const STAGES = [
   {id:"report", label:"Report generation"},
 ];
 
+// How often to ask the server how the run is going. A research pass is
+// minutes long, so a tighter interval buys nothing but requests.
+const POLL_INTERVAL_MS = 2000;
+
 let activeCity = "";
+let activeJobId = null;
 
 function esc(s){
   return String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -263,12 +277,38 @@ function setDetail(id, html){
   if(el) el.innerHTML = html;
 }
 
-// /research is a single blocking call, so stages move as a group rather than
-// one-by-one: all active while the request is in flight, all done on success.
 function setAllStages(state){
   document.querySelectorAll(".stage").forEach(el => {
     el.classList.remove("idle", "active", "done");
     el.classList.add(state);
+  });
+}
+
+// The server reports each node's own state, so the checklist advances one
+// stage at a time instead of lighting up as a group. That was not a styling
+// choice before — POST /research was a single blocking call and there was
+// genuinely nothing finer-grained to show.
+// `failed` is here because a node that raises never reports finishing: the
+// server marks whichever stage was running as failed, and without the mapping
+// it would fall through to "idle" and quietly un-highlight instead of showing
+// where the run stopped.
+const STAGE_CLASS = {queued:"idle", running:"active", succeeded:"done",
+                     failed:"failed"};
+
+function renderProgress(job){
+  (job.stages || []).forEach(stage => {
+    const el = document.getElementById("stage-" + stage.name);
+    if(!el) return;
+    el.classList.remove("idle", "active", "done", "failed");
+    el.classList.add(STAGE_CLASS[stage.state] || "idle");
+
+    // The node's own summary of what it produced, which is the same string
+    // the server logs. Blank until it has run, so an untouched stage stays
+    // visibly untouched rather than claiming zero of everything.
+    if(stage.state === "queued") return;
+    const pass = stage.passes > 1 ? ` · pass ${stage.passes}` : "";
+    const secs = stage.seconds ? ` · ${stage.seconds}s` : "";
+    setDetail(stage.name, `<div class="row">${esc(stage.summary || "running…")}${secs}${pass}</div>`);
   });
 }
 
@@ -298,14 +338,18 @@ async function runResearch(){
   if(!city) return;
 
   const btn = document.getElementById("runBtn");
+  const cancel = document.getElementById("cancelBtn");
   renderStages();
-  setAllStages("active");
+  setAllStages("idle");
   showNotices([]);
   btn.disabled = true;
-  document.getElementById("panel-report").innerHTML =
-    `<div class="empty">Researching ${esc(city)} across five dimensions. This is live internet research — search, a robots.txt and ToS check on every candidate, extraction, then independent fact-checking of each claim — so it takes a while, and the brief appears once every stage has finished.</div>`;
+  cancel.hidden = false;
+  setStatusLine(`Starting research for ${esc(city)}…`);
 
   try{
+    // Returns a job id, not a brief. A run is 10-20 minutes and no proxy
+    // between here and uvicorn will hold a silent request open that long —
+    // see app/jobs.py. So the work happens server-side and we poll it.
     const resp = await fetch(`${API_BASE}/research`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -313,27 +357,89 @@ async function runResearch(){
     });
     if(!resp.ok) throw new Error(await readError(resp));
 
-    const data = await resp.json();
-    activeCity = data.city || city;
-    setAllStages("done");
-    renderRunDetail(data);
-    showNotices(data.warnings);
-    renderReport(data.report_markdown);
-    loadSources();
-    loadGraph();
-    loadCities();
+    const job = await resp.json();
+    activeJobId = job.job_id;
+    activeCity = job.city || city;
+    await pollUntilDone(job.job_id);
   }catch(e){
     setAllStages("idle");
     const msg = (e instanceof TypeError) ? networkMessage() : e.message;
     document.getElementById("panel-report").innerHTML = `<div class="empty">${esc(msg)}</div>`;
   }finally{
     btn.disabled = false;
+    cancel.hidden = true;
+    activeJobId = null;
   }
 }
 
-// /research returns aggregate counts, not per-node events, so only the stages
-// those counts speak to get a detail line. The rest stay blank by design.
-function renderRunDetail(data){
+function setStatusLine(html){
+  document.getElementById("panel-report").innerHTML = `<div class="empty">${html}</div>`;
+}
+
+async function pollUntilDone(jobId){
+  // `wait` makes each poll a short long-poll, so a finished run is reported
+  // the moment it finishes rather than up to POLL_INTERVAL_MS later, and an
+  // unfinished one still answers well inside any proxy deadline.
+  for(;;){
+    const resp = await fetch(`${API_BASE}/research/${encodeURIComponent(jobId)}?wait=10`);
+    if(!resp.ok) throw new Error(await readError(resp));
+    const job = await resp.json();
+
+    renderProgress(job);
+
+    if(job.status === "succeeded"){
+      const data = job.result || {};
+      activeCity = data.city || job.city;
+      setAllStages("done");
+      renderRunDetail(data, job);
+      showNotices(data.warnings);
+      renderReport(data.report_markdown);
+      loadSources();
+      loadGraph();
+      loadCities();
+      return;
+    }
+    if(job.status === "failed" || job.status === "cancelled"){
+      // Named separately from a transport error: the run reached the server
+      // and stopped for a reason the server can state, and anything it
+      // persisted before stopping is still queryable.
+      setStatusLine(
+        `Research ${esc(job.status)} after ${esc(job.elapsed_seconds)}s. ` +
+        `${esc(job.error || "")}<br><br>Any sources and facts recorded before it ` +
+        `stopped are still available under the Sources and Report tabs.`);
+      return;
+    }
+
+    const stage = job.current_stage
+      ? `Running <strong>${esc(stage_label(job.current_stage))}</strong>`
+      : "Queued behind another research run";
+    setStatusLine(
+      `${stage} · ${esc(job.elapsed_seconds)}s elapsed.<br><br>` +
+      `This is live internet research — search, a robots.txt and ToS check on ` +
+      `every candidate, extraction, then independent fact-checking of each ` +
+      `claim — so it takes a while. The brief appears once every stage has ` +
+      `finished, and this page can be left and returned to.`);
+
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+function stage_label(id){
+  const found = STAGES.find(s => s.id === id);
+  return found ? found.label : id;
+}
+
+async function cancelResearch(){
+  if(!activeJobId) return;
+  try{
+    await fetch(`${API_BASE}/research/${encodeURIComponent(activeJobId)}`, {method: "DELETE"});
+  }catch(e){ /* the poll loop will report whatever state the job lands in */ }
+}
+
+// The aggregate counts a finished run reports. Kept alongside the per-stage
+// progress above rather than replacing it: progress says what the node is
+// doing now, this says what the run concluded.
+function renderRunDetail(data, job){
   const c = data.counts || {};
   const covered = (data.covered_dimensions || []).length;
   const total = (data.dimensions || []).length;
@@ -354,7 +460,22 @@ function renderRunDetail(data){
   setDetail("coverage_evaluator",
     `<div class="row">${covered} of ${total} dimensions covered</div>` +
     `<span class="badge g">${c.gaps ?? 0} gaps logged</span>`);
-  setDetail("report", `<div class="row">brief generated and stored</div>`);
+
+  // What the run actually cost the LLM provider, per model. Shown because
+  // the two-model split is invisible otherwise: the point of routing
+  // extraction and the graph writes to the cheap model is a number, and a
+  // number nobody can see is a claim rather than a result.
+  const usage = (job || {}).llm_usage;
+  const cost = usage && usage.calls
+    ? `<div class="row">${usage.calls} LLM calls` +
+      (usage.total_tokens ? ` · ${usage.total_tokens.toLocaleString()} tokens` : "") +
+      (usage.failures ? ` · ${usage.failures} retried` : "") + `</div>` +
+      Object.entries(usage.by_model || {}).map(([model, m]) =>
+        `<div class="row">${esc(model)}: ${m.calls} calls` +
+        (m.total_tokens ? `, ${m.total_tokens.toLocaleString()} tokens` : "") +
+        `</div>`).join("")
+    : "";
+  setDetail("report", `<div class="row">brief generated and stored</div>${cost}`);
 }
 
 // ---------------------------------------------------------------- report

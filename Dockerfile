@@ -29,8 +29,16 @@ COPY scripts ./scripts
 # SQLite file and Milvus Lite database live here; mount a volume to persist.
 RUN mkdir -p /app/data
 
+# PORT is injected by some PaaS hosts (Railway, Render, Fly) and must be obeyed
+# rather than assumed, so both the server and the healthcheck read it. Shell
+# form is required for the expansion — exec form passes ${PORT} through
+# literally.
+ENV PORT=8000
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s \
-    CMD curl -fsS http://localhost:8000/health || exit 1
+    CMD curl -fsS "http://localhost:${PORT}/health" || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# `exec` so uvicorn replaces the shell as PID 1 and receives SIGTERM directly:
+# without it the shell swallows the signal and the platform resorts to SIGKILL,
+# which is how a volume-backed SQLite file gets cut off mid-write.
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"

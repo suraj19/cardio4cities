@@ -213,10 +213,18 @@ class _GraphitiGraphStore:
         # no reasoning_effort knob — so on a thinking model (Gemini 3,
         # o-series) headroom is the only lever available on this path. Too low
         # here shows up as a graph with no edges rather than as an error.
+        #
+        # The model is GRAPHITI_MODEL, which defaults to the bulk model rather
+        # than the judgement one. Graphiti makes the clear majority of a run's
+        # LLM calls — several per fact written — and what it does with an
+        # episode is name the entities in it and the relationship between
+        # them. That is extraction against a fixed schema, not judgement, and
+        # paying frontier rates for it is what turns a run from cents into
+        # dollars. See app/llm/client.py for the same argument in full.
         llm_config = LLMConfig(
             api_key=settings.LLM_API_KEY,
-            model=settings.LLM_MODEL,
-            small_model=settings.LLM_SMALL_MODEL,
+            model=settings.GRAPHITI_MODEL,
+            small_model=settings.LLM_BULK_MODEL,
             base_url=settings.LLM_BASE_URL,
             temperature=0,
             max_tokens=settings.GRAPHITI_MAX_TOKENS,
@@ -243,6 +251,7 @@ class _GraphitiGraphStore:
         # Episodes are plain prose, not chat transcripts or JSON.
         self._episode_type = EpisodeType.text
         self._indices_ready = False
+        self._anchored_cities: set[str] = set()
 
     async def _ensure_indices(self):
         """Graphiti needs its indices and constraints built once per database
@@ -255,6 +264,17 @@ class _GraphitiGraphStore:
 
     async def upsert_city(self, city: str):
         await self._ensure_indices()
+
+        # Once per city per process. The anchor episode is a fixed sentence,
+        # so re-ingesting it extracts the same single entity from the same
+        # text and merges it with itself — but Graphiti has no way to know
+        # that without running its extraction, which is several model calls.
+        # The persistence node runs once per pass and the planner loop allows
+        # three, so this was paying for the identical no-op up to three times
+        # a run, plus once more for every subsequent run of the same city.
+        if city in self._anchored_cities:
+            return
+
         # Graphiti's `add_episode` ingests unstructured text and lets it
         # extract/merge entities itself; for a City anchor node we give it
         # a minimal, unambiguous episode.
@@ -265,6 +285,9 @@ class _GraphitiGraphStore:
             reference_time=datetime.now(timezone.utc),
             source=self._episode_type,
         )
+        # Recorded after the write, so a failure is retried on the next pass
+        # rather than being remembered as done.
+        self._anchored_cities.add(city)
 
     async def add_programme_fact(
         self,

@@ -52,6 +52,7 @@ from app.graph.state import CityResearchState
 from app.llm.client import llm_client
 from app.llm.json_utils import parse_json_list, parse_json_object
 from app.models.schemas import Claim, ConfidenceTier, ExtractedPassage, FactCheckedClaim
+from app.util import relevant_window, tokens
 
 FACT_CHECK_SYSTEM = """You are an INDEPENDENT fact-checker. You did not extract
 this claim and you are not told which source produced it. You are given the
@@ -70,6 +71,10 @@ that does not support the claim is the worst error you can make here.
 
 Set national_vs_city_flag=true if the claim presents national or regional
 information as if it were specific to the city.
+
+Keep `reasoning` to one sentence of at most 25 words, naming the source
+label you relied on. It is read next to the claim in the brief, not instead
+of it.
 
 Return ONLY JSON:
 {"tier": "...", "supporting_sources": ["S1"], "conflicting_text": null,
@@ -105,38 +110,17 @@ that does not support the claim is the worst error you can make here.
 Set national_vs_city_flag=true if the claim presents national or regional
 information as if it were specific to the city.
 
+Keep each `reasoning` to one sentence of at most 25 words, naming the source
+label you relied on. It is read next to the claim in the brief, not instead
+of it.
+
 Return ONLY a JSON list with one object per claim, each echoing the claim's
 label. Include every claim you were given:
 [{"claim": "C1", "tier": "...", "supporting_sources": ["S1"],
   "conflicting_text": null, "reasoning": "...", "national_vs_city_flag": false}]"""
 
-_WORD = re.compile(r"[a-z0-9]{4,}")
 _CLAIM_LABEL = re.compile(r"C\d+")
-
-
-def _tokens(text: str) -> set[str]:
-    return set(_WORD.findall(text.lower()))
-
-
-def _relevant_window(text: str, claim_tokens: set[str], budget: int) -> str:
-    """The `budget` characters of `text` with the most overlap with the claim.
-
-    This used to take the first `budget` characters, which is the cheapest
-    possible choice and often the wrong one: on a long programme page or an
-    annual report, the sentence carrying the figure that would settle a claim
-    is rarely in the opening paragraph. The cost is identical — the same number
-    of characters is sent either way — so head-truncation was paying full price
-    for boilerplate. Choosing the window is what lets the budget stay small.
-    """
-    if len(text) <= budget:
-        return text
-    step = max(budget // 4, 1)
-    best_start, best_score = 0, -1
-    for start in range(0, len(text) - budget + 1, step):
-        score = len(claim_tokens & _tokens(text[start : start + budget]))
-        if score > best_score:
-            best_start, best_score = start, score
-    return text[best_start : best_start + budget]
+_WHITESPACE = re.compile(r"\s+")
 
 
 def _shared_context(
@@ -157,11 +141,11 @@ def _shared_context(
     construction, so nothing is withheld from any of them.
     """
     own_domains = {c.source_domain for c in claims}
-    claim_tokens = _tokens(" ".join(c.text for c in claims))
+    claim_tokens = tokens(" ".join(c.text for c in claims))
     others = [p for p in passages if p.domain not in own_domains]
     ranked = sorted(
         others,
-        key=lambda p: len(claim_tokens & _tokens(p.text)),
+        key=lambda p: len(claim_tokens & tokens(p.text)),
         reverse=True,
     )[: settings.FACT_CHECK_CONTEXT_PASSAGES]
 
@@ -171,7 +155,7 @@ def _shared_context(
 
     block = "\n---\n".join(
         f"[{label}] "
-        + _relevant_window(p.text, claim_tokens, settings.FACT_CHECK_CONTEXT_CHARS)
+        + relevant_window(p.text, claim_tokens, settings.FACT_CHECK_CONTEXT_CHARS)
         for label, p in labels.items()
     )
     return labels, block
@@ -359,6 +343,24 @@ def _batches(pending: list[Claim]) -> list[list[Claim]]:
     ]
 
 
+def _restatement_key(claim: Claim) -> tuple[str, str]:
+    """Identity for "this is the same claim, said again by the same site".
+
+    Government portals repeat a programme description across several pages,
+    and a retry pass discovers those pages one at a time — so the same
+    sentence arrives from the same domain under different claim ids. Each
+    copy used to buy its own adjudication call, and had to reach the same
+    verdict, because the corroboration pool excludes the origin domain and is
+    therefore identical for all of them.
+
+    Keyed on the domain as well as the text on purpose. The *same* sentence
+    from a *different* domain is not a duplicate — it is the corroboration
+    the fact-checker exists to find, and collapsing those would destroy the
+    independent-source count that VERIFIED is derived from.
+    """
+    return claim.source_domain, _WHITESPACE.sub(" ", claim.text).strip().casefold()
+
+
 def fact_check_node(state: CityResearchState) -> dict:
     claims: list[Claim] = state.get("claims", [])
     passages: list[ExtractedPassage] = state.get("passages", [])
@@ -370,7 +372,59 @@ def fact_check_node(state: CityResearchState) -> dict:
     if not pending:
         return {"fact_checked": []}
 
-    with ThreadPoolExecutor(max_workers=settings.LLM_MAX_CONCURRENCY) as pool:
-        batched = list(pool.map(lambda b: _adjudicate_group(b, passages), _batches(pending)))
+    # One representative per restatement goes to the model; the rest are
+    # answered from its verdict. Every claim still gets its own row in the
+    # audit trail with its own source URL, so provenance is unchanged — the
+    # only thing removed is paying twice for the same question.
+    representatives: dict[tuple[str, str], Claim] = {}
+    for claim in pending:
+        representatives.setdefault(_restatement_key(claim), claim)
+    to_adjudicate = list(representatives.values())
 
-    return {"fact_checked": [fact for batch in batched for fact in batch]}
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(settings.LLM_MAX_CONCURRENCY, len(to_adjudicate)))
+    ) as pool:
+        batched = list(
+            pool.map(lambda b: _adjudicate_group(b, passages), _batches(to_adjudicate))
+        )
+
+    verdicts = {fact.claim_id: fact for batch in batched for fact in batch}
+    by_key = {
+        _restatement_key(claim): verdicts[claim.claim_id]
+        for claim in to_adjudicate
+        if claim.claim_id in verdicts
+    }
+
+    checked: list[FactCheckedClaim] = []
+    for claim in pending:
+        adjudicated = by_key.get(_restatement_key(claim))
+        if adjudicated is None:
+            continue
+        if adjudicated.claim_id == claim.claim_id:
+            checked.append(adjudicated)
+        else:
+            # Same verdict, this claim's own identity and origin URL.
+            #
+            # The national-vs-city flag has to be re-derived rather than
+            # copied. `_verdict_to_fact` raises it from the *claim* as well as
+            # from the model's answer (`if not claim.is_city_level`), and
+            # `is_city_level` comes from a separate extraction call per page —
+            # so two pages on one domain can carry the same sentence with
+            # different answers. Copying the representative's flag would then
+            # publish country-level data as city-specific, which is the single
+            # thing this field exists to prevent. Never lowered, only raised.
+            checked.append(
+                adjudicated.model_copy(
+                    update={
+                        "claim_id": claim.claim_id,
+                        "source_url": claim.source_url,
+                        "dimension": claim.dimension,
+                        "national_vs_city_flag": (
+                            adjudicated.national_vs_city_flag
+                            or not claim.is_city_level
+                        ),
+                    }
+                )
+            )
+
+    return {"fact_checked": checked}

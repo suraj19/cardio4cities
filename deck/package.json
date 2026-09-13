@@ -1,0 +1,17 @@
+{
+  "name": "cardio4cities-deck",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Slidev deck for the CARDIO4Cities city-intelligence case study",
+  "type": "module",
+  "scripts": {
+    "dev": "slidev slides.md --open",
+    "build": "slidev build slides.md --out dist",
+    "export": "slidev export slides.md --output cardio4cities-deck.pdf",
+    "export-notes": "slidev export-notes slides.md --output cardio4cities-speaker-notes.pdf"
+  },
+  "dependencies": {
+    "@slidev/cli": "^52.19.1",
+    "@slidev/theme-seriph": "^0.25.0"
+  }
+}

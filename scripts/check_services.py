@@ -56,33 +56,37 @@ def check_dependencies() -> bool:
     return _report("Dependencies", True, f"all {len(required)} imports resolved")
 
 
-def check_llm() -> bool:
+def _check_one_model(label: str, model: str, effort: str, max_tokens: int) -> bool:
     """One minimal chat call — proves the key, the base URL and, importantly,
     that the model ID has not been retired out from under us."""
-    if not settings.LLM_API_KEY:
-        return _report("LLM", False, "LLM_API_KEY is not set in .env")
     try:
         from openai import OpenAI
 
+        from app.llm.client import _answer_text
+
         client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
         kwargs = {}
-        if settings.LLM_REASONING_EFFORT:
-            kwargs["reasoning_effort"] = settings.LLM_REASONING_EFFORT
+        if effort:
+            kwargs["reasoning_effort"] = effort
         response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            max_tokens=settings.LLM_MAX_TOKENS,
+            model=model,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": "Reply with the single word: ready"}],
             **kwargs,
         )
-        text = (response.choices[0].message.content or "").strip()
+        # Unwrapped via the client's helper rather than read directly: a
+        # reasoning model can return a list of chunks here, and `.strip()` on
+        # a list would report the wrong failure for the right problem.
+        text = _answer_text(response.choices[0].message).strip()
         if not text:
             return _report(
-                "LLM",
+                label,
                 False,
-                f"{settings.LLM_MODEL} returned empty content — thinking tokens "
-                f"likely consumed the whole budget. Raise LLM_MAX_TOKENS.",
+                f"{model} returned empty content — thinking tokens likely "
+                f"consumed the whole budget. Raise the max-tokens setting for "
+                f"this role, or lower its reasoning effort.",
             )
-        return _report("LLM", True, f"{settings.LLM_MODEL} replied {text!r}")
+        return _report(label, True, f"{model} replied {text!r}")
     except Exception as exc:
         # The three ways a provider switch fails, in the order they bite. All
         # three present as an opaque 400 or 401 from the shim, so the hint is
@@ -91,8 +95,11 @@ def check_llm() -> bool:
         hint = ""
         if "reasoning_effort" in message or "unknown" in message or "unsupported" in message:
             hint = (
-                " — this provider rejects a parameter we sent rather than "
-                "ignoring it. Clear LLM_REASONING_EFFORT in .env."
+                f" — this model rejects a parameter we sent rather than "
+                f"ignoring it. It was called with reasoning_effort={effort!r}; "
+                f"clear the setting for this role in .env. The two roles have "
+                f"separate settings precisely because one model can implement "
+                f"the parameter while the other does not."
             )
         elif "api key" in message or "unauthor" in message or "401" in message:
             hint = (
@@ -101,10 +108,49 @@ def check_llm() -> bool:
             )
         elif "model" in message or "not found" in message or "404" in message:
             hint = (
-                f" — '{settings.LLM_MODEL}' is not a model this provider serves, "
-                f"or it has been retired. Check the provider's model list."
+                f" — '{model}' is not a model this provider serves, or it has "
+                f"been retired. Check the provider's model list."
             )
-        return _report("LLM", False, f"{type(exc).__name__}: {exc}{hint}")
+        return _report(label, False, f"{type(exc).__name__}: {exc}{hint}")
+
+
+def check_llm() -> bool:
+    """Both configured models, because the pipeline uses both and they fail
+    independently.
+
+    The bulk model is the one worth checking most and the one a single-model
+    check missed entirely: it serves claim extraction and Graphiti's entity
+    extraction, so a retired or misspelled id there produces a run with no
+    claims and an empty graph while the judgement model — and therefore the
+    old version of this check — reported green. Each role also carries its own
+    reasoning effort and token ceiling, and on the Mistral defaults those
+    differ deliberately: Small 4 implements reasoning_effort and Large 3
+    rejects it, so the two calls are genuinely different requests and only one
+    of them can fail on that parameter.
+    """
+    if not settings.LLM_API_KEY:
+        return _report("LLM", False, "LLM_API_KEY is not set in .env")
+
+    judgement = _check_one_model(
+        "LLM (judgement)",
+        settings.LLM_MODEL,
+        settings.LLM_REASONING_EFFORT,
+        settings.LLM_MAX_TOKENS,
+    )
+    # Skipped when both roles resolve to one model, so the common
+    # single-model configuration does not pay for a duplicate call.
+    if settings.LLM_BULK_MODEL == settings.LLM_MODEL and (
+        settings.LLM_BULK_REASONING_EFFORT == settings.LLM_REASONING_EFFORT
+    ):
+        return judgement
+
+    bulk = _check_one_model(
+        "LLM (bulk)",
+        settings.LLM_BULK_MODEL,
+        settings.LLM_BULK_REASONING_EFFORT,
+        settings.LLM_BULK_MAX_TOKENS,
+    )
+    return judgement and bulk
 
 
 def check_neo4j() -> bool:

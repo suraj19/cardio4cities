@@ -84,8 +84,23 @@ def _summarise(result) -> str:
     return ", ".join(counts) if counts else "nothing new"
 
 
+def _job_of(config) -> object | None:
+    """The research job this run belongs to, if it was started as one.
+
+    Reached through LangGraph's `configurable` rather than a module global so
+    two concurrent runs report to their own job, and so the workflow keeps
+    knowing nothing about app.jobs — the dependency points one way, which is
+    what lets the graph still be driven straight from a test with no job at
+    all. A plain `workflow.ainvoke(...)` passes no job and every call below
+    is a no-op.
+    """
+    if not isinstance(config, dict):
+        return None
+    return (config.get("configurable") or {}).get("job")
+
+
 def _timed(name: str, node):
-    """Log a node's start, duration and output size.
+    """Log a node's start, duration and output size, and report both to the job.
 
     A city takes minutes, almost all of it inside two nodes, and the server
     used to log nothing at all between accepting POST /research and answering
@@ -94,29 +109,43 @@ def _timed(name: str, node):
     take from a silent terminal. Timings also make the expensive node
     obvious rather than a matter of opinion: it is normally graph_writer,
     because Graphiti runs its own extraction for every fact written.
+
+    The same two lines now also drive `GET /research/{job_id}`, so the
+    progress a developer reads in the log and the progress a user sees in the
+    browser are the same measurement rather than two that can disagree.
+
+    The wrapper's second parameter must be named `config`: that is the name
+    LangGraph looks for when deciding whether a node wants the run config.
     """
-    def _before(state):
+    def _before(state, config):
         logger.info("[%s] %s ...", state.get("city", "?"), name)
+        job = _job_of(config)
+        if job is not None:
+            job.stage_started(name)
         return time.perf_counter()
 
-    def _after(state, started, result):
+    def _after(state, config, started, result):
+        seconds = time.perf_counter() - started
+        summary = _summarise(result)
         logger.info(
             "[%s] %s finished in %.1fs (%s)",
-            state.get("city", "?"), name, time.perf_counter() - started,
-            _summarise(result),
+            state.get("city", "?"), name, seconds, summary,
         )
+        job = _job_of(config)
+        if job is not None:
+            job.stage_finished(name, seconds, summary)
 
     if inspect.iscoroutinefunction(node):
-        async def wrapper(state):
-            started = _before(state)
+        async def wrapper(state, config=None):
+            started = _before(state, config)
             result = await node(state)
-            _after(state, started, result)
+            _after(state, config, started, result)
             return result
     else:
-        def wrapper(state):
-            started = _before(state)
+        def wrapper(state, config=None):
+            started = _before(state, config)
             result = node(state)
-            _after(state, started, result)
+            _after(state, config, started, result)
             return result
 
     wrapper.__name__ = f"timed_{name}"

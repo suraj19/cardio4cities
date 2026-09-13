@@ -1,0 +1,152 @@
+/* Slidev auto-loads this file. It exists because the seriph theme's default
+   typographic scale assumes far less content than these slides carry: the
+   canvas is a fixed 16:9 box, Slidev does not shrink content to fit it, and
+   anything past the bottom edge is simply not rendered. Most of the room
+   recovered here comes from spacing rather than glyph size, so the deck stays
+   legible on a projector.
+
+   If you add a slide and the bottom still clips, prefer splitting it or moving
+   to `layout: two-cols` over shrinking this further. */
+
+:root {
+  --slidev-code-font-size: 0.68rem;
+  --slidev-code-line-height: 1.4;
+}
+
+.slidev-layout {
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+/* The default layout reserves a wide margin on all four sides. These slides
+   are reference material, not title cards, so they can afford a tighter frame. */
+.slidev-layout.default,
+.slidev-layout.two-cols,
+.slidev-layout.two-cols-header {
+  padding: 2.2rem 2.4rem 1.6rem;
+}
+
+.slidev-layout h1 {
+  font-size: 1.7rem;
+  line-height: 1.2;
+  margin-bottom: 0.7rem;
+}
+
+.slidev-layout h2 {
+  font-size: 1.28rem;
+  line-height: 1.25;
+  margin: 0.7rem 0 0.3rem;
+}
+
+.slidev-layout h3 {
+  font-size: 1rem;
+  line-height: 1.3;
+  margin: 0.55rem 0 0.2rem;
+}
+
+.slidev-layout h1:first-child,
+.slidev-layout h2:first-child,
+.slidev-layout h3:first-child {
+  margin-top: 0;
+}
+
+.slidev-layout p {
+  margin: 0.35rem 0;
+}
+
+.slidev-layout ul,
+.slidev-layout ol {
+  margin: 0.3rem 0;
+  padding-left: 1.15rem;
+}
+
+.slidev-layout li {
+  margin: 0.12rem 0;
+}
+
+.slidev-layout li > ul,
+.slidev-layout li > ol {
+  margin: 0.1rem 0;
+}
+
+.slidev-layout pre {
+  margin: 0.4rem 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.3rem;
+}
+
+/* Deliberately weak selectors: three slides set a smaller table size inline
+   and those scoped rules must keep winning. */
+.slidev-layout table {
+  font-size: 0.8rem;
+  margin: 0.35rem 0;
+}
+
+.slidev-layout th,
+.slidev-layout td {
+  padding: 0.18rem 0.5rem;
+  line-height: 1.35;
+}
+
+.slidev-layout blockquote {
+  margin: 0.4rem 0;
+  padding: 0.35rem 0.7rem;
+}
+
+.slidev-layout hr {
+  margin: 0.5rem 0;
+}
+
+/* Mermaid graphs are sized by the renderer, which does not know about the
+   canvas either. */
+.slidev-layout .mermaid svg {
+  max-height: 62vh;
+}
+
+/* Opt-in for the handful of appendix slides that are still a little taller
+   than the canvas after the rules above. Applied via `class: dense` in the
+   slide's own front-matter, and it must stay below `.slidev-layout` here:
+   both selectors match the same element with equal specificity, so source
+   order is what decides the font size. */
+.dense {
+  font-size: 0.82rem;
+  line-height: 1.36;
+  --slidev-code-font-size: 0.63rem;
+}
+
+.dense h1 {
+  font-size: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.dense h3 {
+  font-size: 0.92rem;
+  margin: 0.4rem 0 0.15rem;
+}
+
+.dense pre {
+  padding: 0.45rem 0.6rem;
+}
+
+/* Last resort, and the reason nothing can be silently lost: a slide that is
+   still too tall scrolls instead of hiding its bottom. This engages only when
+   content genuinely exceeds the canvas, so ordinary slides are unaffected.
+   Note it does not help `npm run export` — a PDF page cannot scroll — so a
+   slide that relies on this should be split before exporting. */
+.slidev-layout {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.slidev-layout::-webkit-scrollbar {
+  width: 5px;
+}
+
+.slidev-layout::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.35);
+  border-radius: 3px;
+}
+
+.slidev-layout::-webkit-scrollbar-track {
+  background: transparent;
+}

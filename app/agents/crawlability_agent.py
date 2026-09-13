@@ -196,8 +196,15 @@ def crawlability_node(state: CityResearchState) -> dict:
     if settings.is_mock:
         return {"crawl_results": [_mock_check(url) for url in pending]}
 
+    # HTTP_MAX_CONCURRENCY, not LLM_MAX_CONCURRENCY: this node issues a
+    # robots.txt GET and an X-Robots-Tag HEAD per URL and makes no model call
+    # at all, so sizing it by the LLM provider's rate limit throttled it for
+    # no reason. On the previous default of 1 that was ~40 requests strictly
+    # serialised, each able to wait HTTP_TIMEOUT_SECONDS.
     cache = _RobotsCache()
-    with ThreadPoolExecutor(max_workers=settings.LLM_MAX_CONCURRENCY) as pool:
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(settings.HTTP_MAX_CONCURRENCY, len(pending)))
+    ) as pool:
         results = list(pool.map(lambda url: _check_live(url, cache), pending))
 
     return {"crawl_results": results}

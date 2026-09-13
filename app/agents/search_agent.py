@@ -23,6 +23,8 @@ surviving URL costs a robots.txt fetch, a page fetch and an LLM call:
     dimension with sparse coverage. Capping per dimension rather than in
     total is what keeps a five-dimension brief balanced.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from app.config import settings
 from app.graph.state import CityResearchState
 from app.models.schemas import PlannedQuery, SourceCandidate
@@ -178,8 +180,26 @@ def search_node(state: CityResearchState) -> dict:
     deduped: list[SourceCandidate] = []
     failures: list[str] = []
 
-    for query in queries:
-        results, warning = _run_query(query, city)
+    # Queries run concurrently but are *consumed* in plan order below, which
+    # is what `pool.map` guarantees and what the dedupe and per-dimension caps
+    # depend on: whichever query finishes first must not get to claim another
+    # dimension's budget. Ten queries issued one at a time was tens of seconds
+    # of pure network wait on the critical path, for work with no dependency
+    # between the items.
+    #
+    # SEARCH_MAX_CONCURRENCY rather than HTTP_MAX_CONCURRENCY because `ddgs`
+    # scrapes consumer engines and answers a burst with a Ratelimit error —
+    # which arrives here as an empty candidate list and reads downstream as a
+    # city nobody has written about.
+    if queries:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(settings.SEARCH_MAX_CONCURRENCY, len(queries)))
+        ) as pool:
+            outcomes = list(pool.map(lambda q: _run_query(q, city), queries))
+    else:
+        outcomes = []
+
+    for results, warning in outcomes:
         if warning:
             failures.append(warning)
         for candidate in results:
