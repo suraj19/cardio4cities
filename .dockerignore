@@ -11,7 +11,6 @@ __pycache__
 
 # Secrets and local state. `data` is a runtime volume, not image content —
 # baking a dev SQLite file into the image would ship stale research.
-.env
 data
 *.db
 *.sqlite3
