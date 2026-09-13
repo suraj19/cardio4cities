@@ -1,6 +1,3 @@
-# Secrets — never commit real keys
-.env
-
 # Local data: SQLite file, Milvus Lite database, cached embedding model
 data/
 *.db
