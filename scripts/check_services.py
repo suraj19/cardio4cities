@@ -35,7 +35,7 @@ def check_dependencies() -> bool:
         "requests": "requests",
         "openai": "openai",
         "pymilvus": "pymilvus",
-        "sentence_transformers": "sentence-transformers",
+        "fastembed": "fastembed",
         "neo4j": "neo4j",
         "graphiti_core": "graphiti-core",
     }
@@ -64,7 +64,9 @@ def _check_one_model(label: str, model: str, effort: str, max_tokens: int) -> bo
 
         from app.llm.client import _answer_text
 
-        client = OpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_BASE_URL)
+        client = OpenAI(
+            api_key=settings.LLM_API_KEY or "local", base_url=settings.LLM_BASE_URL
+        )
         kwargs = {}
         if effort:
             kwargs["reasoning_effort"] = effort
@@ -111,6 +113,20 @@ def _check_one_model(label: str, model: str, effort: str, max_tokens: int) -> bo
                 f" — '{model}' is not a model this provider serves, or it has "
                 f"been retired. Check the provider's model list."
             )
+            if settings.llm_is_local:
+                hint = (
+                    f" — Ollama has no model named '{model}'. Pull it first: "
+                    f"`ollama pull {model}`, and check `ollama list` for the "
+                    f"exact tag — the name must match including the `:tag`."
+                )
+        elif settings.llm_is_local and (
+            "connection" in message or "refused" in message
+        ):
+            hint = (
+                f" — nothing is listening on {settings.LLM_BASE_URL}. Start the "
+                f"server with `ollama serve` (see the context-window check below "
+                f"for the environment variable it needs)."
+            )
         return _report(label, False, f"{type(exc).__name__}: {exc}{hint}")
 
 
@@ -128,8 +144,13 @@ def check_llm() -> bool:
     rejects it, so the two calls are genuinely different requests and only one
     of them can fail on that parameter.
     """
-    if not settings.LLM_API_KEY:
-        return _report("LLM", False, "LLM_API_KEY is not set in .env")
+    if not settings.LLM_API_KEY and not settings.llm_is_local:
+        return _report(
+            "LLM",
+            False,
+            "LLM_API_KEY is not set in .env. To run inference locally with no "
+            "key, set LLM_BASE_URL=http://localhost:11434/v1 instead.",
+        )
 
     judgement = _check_one_model(
         "LLM (judgement)",
@@ -151,6 +172,108 @@ def check_llm() -> bool:
         settings.LLM_BULK_MAX_TOKENS,
     )
     return judgement and bulk
+
+
+def check_embeddings() -> bool:
+    """Actually encode something, rather than just importing fastembed.
+
+    Worth its own check because this one component sits under both evidence
+    stores — Milvus embeds the passage and the question, and Graphiti's
+    retrieval embeds the question through the same LocalEmbedder. When it
+    fails, `/ask` reports the vector store AND the knowledge graph as
+    unavailable, which reads as two unrelated outages and sends you off
+    checking two databases that are both fine.
+
+    Importing the package is not enough: the weights are downloaded from
+    Hugging Face on first use, so the failure is at encode time, not import
+    time. On a network with TLS interception that surfaces as a certificate
+    error from deep inside httpx.
+    """
+    try:
+        from app.llm.embeddings import embed_one
+
+        width = len(embed_one("preflight probe"))
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        hint = ""
+        if "certificate" in message.lower() or "ssl" in message.lower():
+            hint = (
+                " — this is a TLS failure reaching huggingface.co, not a "
+                "problem with the model. On a corporate network, point "
+                "REQUESTS_CA_BUNDLE and SSL_CERT_FILE at your proxy's CA "
+                "bundle, or pre-populate the cache from a machine that can "
+                "reach it and copy it to the path in FASTEMBED_CACHE_PATH."
+            )
+        elif isinstance(exc, ImportError):
+            hint = (
+                " — `pip install -r requirements.txt` in the interpreter "
+                "running uvicorn. This moved from sentence-transformers to "
+                "fastembed, so an older environment satisfies the import list "
+                "but not this one."
+            )
+        return _report("Embeddings", False, f"{message}{hint}")
+    return _report(
+        "Embeddings", True, f"{settings.EMBEDDING_MODEL} encoded to {width} dimensions"
+    )
+
+
+def check_local_context_window() -> bool:
+    """For a local model server, report the context window it will actually use.
+
+    This exists because the failure it catches is silent, and it is the one
+    that bites every first attempt at running this pipeline on Ollama. Ollama
+    defaults to a small context — 4k unless the machine has a lot of VRAM —
+    and it *truncates* longer prompts rather than refusing them. Graphiti's
+    entity-extraction prompts are well past 4k. The result is a run that
+    completes, writes a knowledge graph with no fact edges, and reports no
+    error anywhere: the prompt was cut off mid-instruction and the model
+    answered a question nobody asked.
+
+    It cannot be fixed from our side. Ollama's own OpenAI-compatibility
+    documentation states that the OpenAI API has no way to set the context
+    size, so `num_ctx` has to be set on the server — hence a check rather than
+    a setting.
+
+    Runs after check_llm deliberately. That check makes a real completion,
+    which loads the model, so /api/ps has something to report by the time we
+    get here.
+    """
+    if not settings.llm_is_local:
+        return True
+
+    import requests
+
+    root = settings.LLM_BASE_URL.rsplit("/v1", 1)[0].rstrip("/")
+    try:
+        running = requests.get(f"{root}/api/ps", timeout=5).json().get("models", [])
+    except Exception as exc:
+        return _report(
+            "Local context window",
+            False,
+            f"could not reach the Ollama admin API at {root} "
+            f"({type(exc).__name__}) — is `ollama serve` running?",
+        )
+
+    if not running:
+        return _report(
+            "Local context window",
+            True,
+            "no model loaded yet, so the window cannot be read. Start a run, "
+            "then check `ollama ps` shows CONTEXT >= 32768",
+        )
+
+    smallest = min(model.get("context_length") or 0 for model in running)
+    loaded = ", ".join(model.get("name", "?") for model in running)
+    if smallest and smallest < 32768:
+        return _report(
+            "Local context window",
+            False,
+            f"{loaded} has only {smallest} tokens of context. Graphiti's "
+            f"prompts exceed this and Ollama truncates silently, which shows "
+            f"up as a graph with no fact edges. Restart the server with "
+            f"OLLAMA_CONTEXT_LENGTH=32768 set in its environment.",
+        )
+    return _report("Local context window", True, f"{loaded}: {smallest} tokens")
 
 
 def check_neo4j() -> bool:
@@ -276,6 +399,11 @@ def main() -> int:
         # be reached because a parser was never installed.
         check_dependencies(),
         check_llm(),
+        # After check_llm, which loads the model so its window can be read.
+        check_local_context_window(),
+        # Before the two stores that depend on it, so a failure here explains
+        # the failures below rather than being buried under them.
+        check_embeddings(),
         check_neo4j(),
         check_milvus(),
         check_search(),

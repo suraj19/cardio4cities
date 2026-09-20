@@ -3,6 +3,7 @@
 # live keys and must never be pushed. The Neo4j Sandbox credentials file and
 # the connection log are named explicitly because they arrive with those
 # names from the Sandbox console and are easy to commit without noticing.
+.env
 .env.*
 !.env.example
 *Sandbox*Credentials*.txt

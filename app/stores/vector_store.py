@@ -5,7 +5,7 @@ This is the "answer open-ended questions about what's being done" layer —
 it doesn't need strict schema, just good nearest-neighbor recall over the
 raw text extracted from ALLOWED sources.
 
-Uses Milvus with the shared local sentence-transformers model, so no
+Uses Milvus with the shared local ONNX embedding model, so no
 external embedding API is required. MILVUS_URI decides the topology
 without any code change: a path ending in .db runs Milvus Lite embedded
 (what the demo deployment uses), while an http:// URI or a Zilliz Cloud
@@ -22,6 +22,7 @@ import logging
 from app.config import settings
 from app.llm import embeddings
 from app.stores.lazy import LazyStore
+from app.telemetry import span
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,18 @@ class _MilvusVectorStore:
     def add_passages(self, city: str, passages):
         if not passages:
             return
+        with span(
+            "milvus.upsert",
+            **{
+                "db.system": "milvus",
+                "db.collection.name": self.collection_name,
+                "cardio4cities.city": city,
+                "cardio4cities.passages": len(passages),
+            },
+        ):
+            self._upsert(city, passages)
 
+    def _upsert(self, city: str, passages):
         vectors = embeddings.embed_many([p.text for p in passages])
         data = [
             {
@@ -199,6 +211,20 @@ class _MilvusVectorStore:
         self.client.upsert(collection_name=self.collection_name, data=data)
 
     def query(self, city: str, question: str, n_results: int = 5):
+        with span(
+            "milvus.search",
+            **{
+                "db.system": "milvus",
+                "db.collection.name": self.collection_name,
+                "cardio4cities.city": city,
+                "cardio4cities.limit": n_results,
+            },
+        ) as current:
+            matches = self._search(city, question, n_results)
+            current.set_attribute("cardio4cities.matches", len(matches))
+            return matches
+
+    def _search(self, city: str, question: str, n_results: int):
         results = self.client.search(
             collection_name=self.collection_name,
             data=[embeddings.embed_one(question)],

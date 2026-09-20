@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 from app.config import settings
 from app.llm.usage import ledger
+from app.telemetry import content_attributes, record_llm_usage, span
 
 _MAX_ATTEMPTS = 4
 _BACKOFF_SECONDS = 2.0
@@ -64,6 +65,30 @@ _RETRYABLE_MARKERS = (
 def _is_retryable(exc: Exception) -> bool:
     message = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in message for marker in _RETRYABLE_MARKERS)
+
+
+def _system_name() -> str:
+    """The provider, for `gen_ai.system`, derived from the endpoint.
+
+    Derived rather than configured because the endpoint is already the single
+    thing that selects a provider here, and a second setting that could
+    disagree with it would eventually disagree with it.
+    """
+    host = settings.LLM_BASE_URL.lower()
+    for marker, name in (
+        ("mistral", "mistral"),
+        ("openai.com", "openai"),
+        ("googleapis", "gcp.gemini"),
+        ("deepseek", "deepseek"),
+        ("groq", "groq"),
+        ("openrouter", "openrouter"),
+        ("11434", "ollama"),
+        ("localhost", "local"),
+        ("127.0.0.1", "local"),
+    ):
+        if marker in host:
+            return name
+    return "openai_compatible"
 
 
 def _answer_text(message) -> str:
@@ -149,16 +174,23 @@ class LLMClient:
         as a failed request instead of preventing the app from starting (which
         would take /health down with it and leave the container restarting)."""
         if self._client is None:
-            if not settings.LLM_API_KEY:
+            if not settings.LLM_API_KEY and not settings.llm_is_local:
                 raise ValueError(
                     "LLM_API_KEY is required when RUN_MODE=LIVE. Set it in .env "
-                    "alongside LLM_BASE_URL and LLM_MODEL, or switch to RUN_MODE=MOCK."
+                    "alongside LLM_BASE_URL and LLM_MODEL, or switch to RUN_MODE=MOCK. "
+                    "To run inference locally instead, point LLM_BASE_URL at "
+                    "http://localhost:11434/v1 (Ollama) and no key is needed."
                 )
 
             from openai import OpenAI
 
             self._client = OpenAI(
-                api_key=settings.LLM_API_KEY,
+                # The SDK refuses to construct without a key, and a local
+                # server ignores whatever it is sent, so the placeholder is
+                # what makes a keyless local run possible at all. Only used
+                # when LLM_API_KEY is genuinely absent — pointing at Ollama
+                # does not discard a key that was set.
+                api_key=settings.LLM_API_KEY or "local",
                 base_url=settings.LLM_BASE_URL,
             )
         return self._client
@@ -178,10 +210,28 @@ class LLMClient:
         been handed. Everything else gets the judgement profile — see the
         module docstring for why that distinction is the entire cost story.
         """
-        if settings.is_mock:
-            return self._mock_complete(system, user)
-
         profile = _profile(bulk)
+
+        if settings.is_mock:
+            # Traced too, so the shape of a MOCK trace matches a LIVE one.
+            # That is what makes the instrumentation testable offline — and a
+            # MOCK run whose trace is missing a span is how you find a call
+            # site nobody instrumented. `gen_ai.system` says "mock" so no
+            # reader mistakes these for calls that cost anything.
+            with span(
+                f"chat {profile.model}",
+                **{
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.system": "mock",
+                    "gen_ai.request.model": profile.model,
+                    "cardio4cities.llm.profile": "bulk" if bulk else "judgement",
+                    **content_attributes(system=system, user=user),
+                },
+            ) as current:
+                answer = self._mock_complete(system, user)
+                current.set_attribute("cardio4cities.llm.answer_chars", len(answer))
+                current.set_attributes(content_attributes(completion=answer))
+                return answer
 
         kwargs = {}
         if profile.reasoning_effort:
@@ -202,6 +252,22 @@ class LLMClient:
             **kwargs,
         )
         prompt_chars = len(system) + len(user)
+        # Attribute names follow the OpenTelemetry GenAI semantic conventions
+        # so a backend recognises this as a model call rather than an
+        # anonymous span. Prompts and completions are recorded only when
+        # OTEL_CAPTURE_CONTENT is explicitly on — they carry scraped page
+        # content, so the default is not to copy it into a trace backend.
+        span_attributes = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system": _system_name(),
+            "gen_ai.request.model": profile.model,
+            "gen_ai.request.max_tokens": request["max_tokens"],
+            "cardio4cities.llm.profile": "bulk" if bulk else "judgement",
+            "cardio4cities.llm.prompt_chars": prompt_chars,
+        }
+        if profile.reasoning_effort:
+            span_attributes["gen_ai.request.reasoning_effort"] = profile.reasoning_effort
+        span_attributes.update(content_attributes(system=system, user=user))
 
         # Extraction and fact-checking fan out to LLM_MAX_CONCURRENCY parallel
         # calls, which on a free-tier key reliably earns a 429. Retrying here
@@ -209,35 +275,69 @@ class LLMClient:
         # fact-check call fails safe to UNSUPPORTED, so a rate limit would
         # silently read as "this claim could not be corroborated".
         last_error: Exception | None = None
-        for attempt in range(_MAX_ATTEMPTS):
-            try:
-                response = self._get_client().chat.completions.create(**request)
-            except Exception as exc:
-                last_error = exc
-                retrying = _is_retryable(exc) and attempt < _MAX_ATTEMPTS - 1
-                # Each attempt is recorded, including the ones that will be
-                # retried. A run whose cost looks inexplicable is usually a
-                # run that spent it on retries, and a ledger that counted
-                # only successes could not show that.
-                ledger.record(
-                    profile.model, prompt_chars=prompt_chars, failed=True
-                )
-                if not retrying:
-                    raise
-                time.sleep(_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.5))
-                continue
+        # One span covers the whole call INCLUDING its retries, with each
+        # attempt as an event. A span per attempt would be more literal and
+        # much less useful: what a reader wants to know is how long this call
+        # took end to end, and a rate-limited call that succeeded on its
+        # fourth attempt after 30 seconds of backoff is the single most
+        # important thing this span can show.
+        with span(f"chat {profile.model}", **span_attributes) as current:
+            for attempt in range(_MAX_ATTEMPTS):
+                try:
+                    response = self._get_client().chat.completions.create(**request)
+                except Exception as exc:
+                    last_error = exc
+                    retrying = _is_retryable(exc) and attempt < _MAX_ATTEMPTS - 1
+                    # Each attempt is recorded, including the ones that will be
+                    # retried. A run whose cost looks inexplicable is usually a
+                    # run that spent it on retries, and a ledger that counted
+                    # only successes could not show that.
+                    ledger.record(
+                        profile.model, prompt_chars=prompt_chars, failed=True
+                    )
+                    record_llm_usage(profile.model, 0, 0, failed=True)
+                    current.add_event(
+                        "llm.attempt.failed",
+                        {
+                            "attempt": attempt + 1,
+                            "retrying": retrying,
+                            "error.type": type(exc).__name__,
+                            "error.message": str(exc)[:300],
+                        },
+                    )
+                    if not retrying:
+                        raise
+                    time.sleep(_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.5))
+                    continue
 
-            usage = getattr(response, "usage", None)
-            ledger.record(
-                profile.model,
-                prompt_chars=prompt_chars,
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-            )
-            # A thinking model that exhausts its budget mid-thought returns
-            # no content. Every caller parses this, so hand back a string
-            # rather than None and let their fallbacks handle it.
-            return _answer_text(response.choices[0].message)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                ledger.record(
+                    profile.model,
+                    prompt_chars=prompt_chars,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+                record_llm_usage(profile.model, prompt_tokens, completion_tokens)
+                current.set_attributes(
+                    {
+                        "gen_ai.usage.input_tokens": prompt_tokens,
+                        "gen_ai.usage.output_tokens": completion_tokens,
+                        "cardio4cities.llm.attempts": attempt + 1,
+                    }
+                )
+                # A thinking model that exhausts its budget mid-thought returns
+                # no content. Every caller parses this, so hand back a string
+                # rather than None and let their fallbacks handle it.
+                answer = _answer_text(response.choices[0].message)
+                # Length, not content. An empty answer is the signature of a
+                # blown thinking budget, and it is otherwise invisible: the
+                # call succeeded, the tokens were spent, and the caller
+                # silently falls back.
+                current.set_attribute("cardio4cities.llm.answer_chars", len(answer))
+                current.set_attributes(content_attributes(completion=answer))
+                return answer
 
         raise last_error  # unreachable; keeps the type checker honest
 

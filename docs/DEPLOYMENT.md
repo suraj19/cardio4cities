@@ -19,7 +19,7 @@ demo, and only **one** of the eight is a server you have to operate yourself.
 | 4 | **Neo4j Graph Database Sandbox** | Temporal knowledge graph, written through Graphiti | Hosted by Neo4j at [sandbox.neo4j.com](https://sandbox.neo4j.com) | **Yes** in LIVE mode | Free, **expires** |
 | 5 | **LLM provider** (Mistral by default) | Query planning, claim extraction, fact-check adjudication, narrative, `/ask` | Hosted, any OpenAI-compatible chat endpoint | **Yes** in LIVE mode | $0 on Mistral's free plan, or ~$0.14/city paid — see §3.5 |
 | 6 | **Tavily** | Higher-quality search discovery | Hosted | No — falls back to DuckDuckGo | Free tier |
-| 7 | **sentence-transformers** (`all-MiniLM-L6-v2`) | Local embeddings, shared by Milvus and Graphiti | In-process, baked into the image | **Yes** | Free, no key |
+| 7 | **fastembed / ONNX** (`all-MiniLM-L6-v2`) | Local embeddings, shared by Milvus and Graphiti | In-process, baked into the image | **Yes** | Free, no key |
 | 8 | **WHO GHO + World Bank Open Data** | Country-level indicators for `cv_burden` and `health_system` | Hosted, public REST | No — falls back to web discovery | Free, **no key** |
 
 Two things follow from this table, and both are worth being able to say out
@@ -40,7 +40,7 @@ graph LR
   U[Browser] --> A[App container<br/>FastAPI + static UI<br/>:8000]
   A --> S[(SQLite<br/>embedded file)]
   A --> M[(Milvus Lite<br/>embedded file)]
-  A --> E[sentence-transformers<br/>in-process]
+  A --> E[fastembed / ONNX<br/>in-process]
   A -.bolt.-> N[(Neo4j Sandbox<br/>hosted)]
   A -.https.-> L[LLM provider<br/>Mistral / DeepSeek / Gemini / Groq<br/>judgement + bulk models]
   A -.https.-> T[Tavily or DuckDuckGo]
@@ -111,6 +111,16 @@ loading the embedding model into RAM.
 **Resources.** ~1 GB RAM for the embedding model plus headroom; 2 GB total is
 comfortable with Milvus Lite. One vCPU is fine; research runs are
 network-bound, not CPU-bound.
+
+Embeddings run on **ONNX via `fastembed`**, not `sentence-transformers`, and
+that choice is what makes the small hosts viable. The weights are the same
+`all-MiniLM-L6-v2`; the difference is the runtime. `sentence-transformers`
+depends on `torch`, whose default linux/x86_64 wheel on PyPI is the CUDA build
+— roughly 2 GB of `nvidia-*` packages, on hosts that have no GPU — and
+`torch` plus the model is 500–800 MB resident. `onnxruntime` holds the same
+model in roughly 150–250 MB. That moves the app from "needs ~1 GB" to
+"fits in 0.5 GB", which is the difference between deploying on Railway's Free
+plan and not. See `app/llm/embeddings.py` for why ranking is unaffected.
 
 ### 3.2 SQLite (relational store)
 
@@ -232,6 +242,50 @@ survivable:
 | Per **day** | A wall. Stops unfinished, waits 24h | `gemini-3.5-flash` 20 req/day; Groq 70B 100k tok/day |
 | Per **month** | A budget. 600k against 1B is noise | Mistral 1B tok/month |
 | Per **second** | A throttle. Slower, still finishes | Mistral's request rate |
+| **None** | Only your own wall-clock | A local Ollama — see 3.5.1 |
+
+<!-- keep the metering table above; the row below belongs to troubleshooting -->
+
+### `/ask` returns 404 or 503
+
+`POST /ask` reads two stores and refuses to answer from neither. The status
+code distinguishes the two reasons, and they need opposite responses:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| **404** `Nothing indexed for '<city>' yet` | Both stores were read successfully and are genuinely empty for that city | Research the city first. Check the spelling matches the brief — `GET /cities` lists what exists |
+| **503** `Neither evidence store could be read` | Both stores raised | Fix the outage. Researching again will not help, and on a metered key it is expensive wasted effort |
+
+The 503 detail names both exceptions, and when they are the same type it also
+names the likeliest cause: **the local embedding model**. The two stores look
+independent — different databases, different hosts — but Milvus embeds the
+question to search and Graphiti's hybrid retrieval embeds it too, through the
+same `LocalEmbedder`. A model that cannot load takes out both at once and
+presents as two unrelated outages, which sends you off checking two healthy
+databases. Run `python -m scripts.check_services`; the `Embeddings` check
+encodes a real string rather than just importing the package, because the
+weights are downloaded from Hugging Face on first use and the failure is at
+encode time.
+
+Two ways that download fails in practice:
+
+- **`fastembed` is not installed in the interpreter running uvicorn.** This
+  project moved from `sentence-transformers` to `fastembed`, so an environment
+  created before that change satisfies every other import and fails this one.
+  `pip install -r requirements.txt`.
+- **A TLS interception proxy.** Surfaces as
+  `ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] ... unable to get local
+  issuer certificate` from inside httpx, which reads like a database problem
+  and is not one. Point `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` at the
+  proxy's CA bundle, or pre-populate the model cache from a machine that can
+  reach huggingface.co and copy it to `FASTEMBED_CACHE_PATH`.
+
+Note also that **Milvus Lite has no Windows build**. On Windows,
+`MILVUS_URI=./data/milvus.db` fails with `milvus-lite is required for local
+database connections`; use the server (`docker compose -f
+docker-compose.milvus.yml up -d`, then `MILVUS_URI=http://localhost:19530`) or
+run under WSL. A `MILVUS_URI` pointing at a server that is not running is the
+other common way the vector half of `/ask` comes back empty.
 
 Only the throttle is absorbable, and only because `POST /research` no longer
 holds an HTTP request open (see §4.1 and `app/jobs.py`). An hour-long run is
@@ -347,6 +401,61 @@ that break a provider switch outright:
 - **`GRAPHITI_MAX_TOKENS`** needs headroom because Graphiti has no
   reasoning-effort knob. Too low shows up as a graph with no fact edges rather
   than as an error.
+
+#### 3.5.1 Ollama — removing the rate limit entirely
+
+The one option in the table above with no metering of any kind, and no API
+key. It is a **local** path: a Railway free-tier container has 0.5 GB of RAM
+and cannot host a model, so this is for development, evaluation and demos on
+your own machine, not for the deployed service.
+
+```bash
+ollama pull qwen3:8b
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve      # PowerShell: $env:OLLAMA_CONTEXT_LENGTH=32768; ollama serve
+```
+
+```bash
+# .env — LLM_API_KEY stays empty, and comment out LLM_REASONING_EFFORT
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen3:8b
+LLM_BULK_MODEL=qwen3:8b
+LLM_BULK_REASONING_EFFORT=none
+```
+
+Then `python -m scripts.check_services`, which calls both profiles and reads
+the server's real context window.
+
+**No key is required** because `Settings.llm_is_local` recognises the host as
+local, and `app/llm/client.py` and `app/stores/graph_store.py` both skip the
+key requirement in that case. The OpenAI SDK will not construct without *some*
+key, so a placeholder is passed; Ollama's own documentation describes the
+`api_key` as "required but ignored". A LAN address such as `192.168.1.20` is
+deliberately **not** treated as local — the relaxation is scoped to loopback,
+`host.docker.internal` and `.local` names.
+
+**Both reasoning-effort settings default to empty** whenever the base URL is
+local. Ollama does implement `reasoning_effort` (`none`/`low`/`medium`/`high`/
+`max`), but LM Studio and llama.cpp are reached the same way and do not all,
+and on a local server thinking is spent in wall-clock rather than money —
+which is the trade the judgement/bulk split was making in the first place.
+Setting `LLM_BULK_REASONING_EFFORT=none` explicitly is still worth it on a
+hybrid model like `qwen3`, because it turns thinking off for the ~120 bulk
+calls rather than merely leaving it unspecified.
+
+**`OLLAMA_CONTEXT_LENGTH=32768` is the step that matters.** Ollama defaults to
+a small window and truncates over-long prompts instead of refusing them, and
+Graphiti's prompts are well past 4k. The failure is completely silent: the run
+finishes, the brief looks plausible, and the knowledge graph has no fact
+edges. It cannot be fixed from the client — Ollama's OpenAI-compatibility
+documentation states the OpenAI API has no way to set context size — so
+`check_services.py` probes `/api/ps` after the model is loaded and fails when
+the window is under 32768.
+
+**Budget the time.** 150–250 calls against a local 8B model is tens of minutes
+on a GPU and hours on CPU. This is usable only because a run is a background
+job with pollable progress; against the old blocking endpoint it would have
+been impossible. Embeddings are unaffected — they were already local, in
+`fastembed`, and do not go to Ollama at all.
 
 ### 3.6 Tavily (optional)
 
@@ -466,9 +575,16 @@ Three things behave differently here than on a VM:
   pinned to 1 for that reason. Scaling out means moving off both embedded
   stores — Railway Postgres (see §3.2) and Zilliz Cloud (§3.3 option C) — at
   which point the volume can go away entirely.
-- **Sleeping is fatal to a demo.** `PREWARM_EMBEDDINGS=true` (the default)
-  loads the model during startup rather than on the first request, so a warm
-  service answers immediately — but a service that has been asleep pays the
+- **Leave `PREWARM_EMBEDDINGS` off here unless you have checked the memory
+  ceiling.** It defaults to `false` for this reason. Setting it `true` loads
+  the model during startup rather than on the first request, which is what you
+  want for a demo — a warm service answers immediately. But it also imports
+  torch and allocates ~1 GB in the first seconds of every container start, and
+  if the service is capped below that, the kernel kills the process before it
+  can log anything. The result is a restart loop that reads like an
+  application bug and is really a memory limit. Raise the service's memory
+  first, then turn it on.
+- **Sleeping is fatal to a demo.** A service that has been asleep pays the
   whole cold start, container plus model, while someone is watching. Keep it
   always-on.
 
@@ -506,7 +622,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 `RUN_MODE=MOCK` needs no keys and no external service at all — it exercises the
-full nine-node graph against canned data, which is what the test suite uses:
+full ten-node graph against canned data, which is what the test suite uses:
 
 ```bash
 RUN_MODE=MOCK pytest -v
@@ -578,7 +694,7 @@ of degraded modes is in
 | A run is slow and you want to know where | `GET /research/{job_id}` reports every node's state, elapsed seconds and what it produced — the same measurement the log prints | If `graph_writer` is the slow one that is expected: Graphiti re-extracts entities for every fact. Raise `GRAPH_WRITE_CONCURRENCY`, or use the demo profile in `.env.example` §Cost |
 | A job disappeared with a 404 | Finished jobs are kept for `JOB_RETENTION_SECONDS` (1h), and a restart forgets in-flight ones | The brief is stored permanently — `GET /report/{city}`. Only the progress detail expires |
 | `llm_usage` shows every call against one model | The two-model split is misconfigured — `LLM_BULK_MODEL` is unset or equal to `LLM_MODEL` | Set both. On the Mistral defaults this is roughly a 3x difference in the bill for identical JSON |
-| The very first run is slow before any node finishes | `sentence-transformers` downloads `all-MiniLM-L6-v2` (~90 MB) lazily on the first embed | One-off. It is cached afterwards; pre-warm with `python -c "from app.llm import embeddings; embeddings.get_model()"` |
+| The very first run is slow before any node finishes | `fastembed` downloads the `all-MiniLM-L6-v2` ONNX weights lazily on the first embed | One-off, and it does not happen in the container at all — the Dockerfile bakes the model. Locally it is cached afterwards; pre-warm with `python -c "from app.llm import embeddings; embeddings.get_model()"` |
 | `/health` reports `graph: unreachable`; `/graph/{city}` returns 503 | Sandbox expired or was restarted | Re-copy **both** the Bolt URI and the password from sandbox.neo4j.com |
 | Research completes but the brief is nearly all Gaps | LLM returning empty or malformed output | Check `LLM_API_KEY`; raise `LLM_MAX_TOKENS`. On a *thinking* model also set `LLM_REASONING_EFFORT=low`, since thinking tokens can consume the whole answer budget |
 | Run Warnings say *"No source could be read because 'beautifulsoup4' is not installed"* | The HTML parser is missing from the environment running uvicorn, so no page can be parsed | `pip install -r requirements.txt` **in the interpreter uvicorn is using**. Confirm with `python scripts/check_services.py`, whose first check is now the import list |
@@ -590,6 +706,11 @@ of degraded modes is in
 | Every LLM call fails with an opaque 400 right after switching provider | A reasoning-effort setting is populated for a model that doesn't implement it. Unimplemented parameters are **rejected**, not ignored | Clear the setting for *that role*. The two are separate because `mistral-small-latest` takes `none` while `mistral-large-latest` takes nothing at all |
 | Claims and search queries come back empty on a model that is definitely answering | A reasoning model returned `message.content` as a list of thinking/text chunks rather than a string, so `json.loads` saw nothing usable. Happens on `mistral-small-latest` at `reasoning_effort=high` | Use `none`. `app/llm/client._answer_text` unwraps the chunk list defensively, so this should not reach you — if it does, a provider is using a chunk shape it does not describe |
 | 401 / "API key not valid" right after switching provider | Keys are per-provider; the base URL changed but the key didn't | Issue a key from the provider that owns `LLM_BASE_URL`. `check_services.py` now says this explicitly |
+| Running on **Ollama**: the run completes, the brief looks reasonable, but `GET /graph/{city}` returns **nothing** and the graph has no fact edges | **The single most common local failure.** Ollama defaults to a small context window and **truncates** over-long prompts instead of refusing them. Graphiti's entity-extraction prompts are past 4k, so the model answers a question that was cut off mid-instruction. Nothing errors | Restart the server with `OLLAMA_CONTEXT_LENGTH=32768` in its environment. The OpenAI-compatible API cannot set context size per request, so this is server-side only. `python -m scripts.check_services` reads the live value from `/api/ps` and fails the check when it is too small |
+| Running on Ollama: `LLM_API_KEY is required when RUN_MODE=LIVE` | `LLM_BASE_URL` does not resolve to a local host, so the key requirement still applies | Use `localhost`, `127.0.0.1`, `host.docker.internal` or a `.local` name. A LAN IP such as `192.168.1.20` is **not** treated as local — see `Settings.llm_is_local` |
+| Running on Ollama: 404 / "model not found" | The model tag in `.env` is not one that has been pulled. Tags are exact, including the `:8b` part | `ollama list` to see the real tags, then `ollama pull qwen3:8b`. `check_services.py` names the pull command for the model you configured |
+| Running on Ollama: a single city takes hours | Expected. 150–250 calls against a local model is tens of minutes on a GPU and hours on CPU — unmetered is not the same as fast | Nothing to fix, and this is why a run is a pollable background job. Use a smaller model, a GPU, or a hosted provider for the demo itself |
+| Running on Ollama: extraction returns few claims, or claims with invented fields | The model is too small for structured extraction. Below roughly 7B this degrades sharply | Move up to `qwen3:30b` or `gpt-oss:20b` if memory allows. The trust machinery will discard the bad claims, so this shows up as a thin brief rather than a wrong one |
 | Mistral returns `429 Rate limit exceeded` (code 1300) on the **very first** call, and waiting does not help | Not a throttle. Check the response header `x-ratelimit-limit-req-minute` — if it reads **`0`**, the account has no completions allowance at all. The key authenticates, which is why this presents as 429 rather than 401 | Activate the free Experiment plan in the Mistral Admin Console (phone verification, no card), or check whether the Organization/Workspace monthly spending limit is set to zero. No code change will fix it |
 | Mistral returns `403 tier_not_allowed` (code 1910) for `mistral-large-latest` | Large 3 is **not served on the free tier**. It is also absent from `GET /v1/models` for a free key | Use `mistral-medium-latest` (the default). List what your key can actually reach with `curl https://api.mistral.ai/v1/models -H "Authorization: Bearer $LLM_API_KEY"` |
 | Constant 429s and `Retrying _generate_response_with_retry after N attempts` | Concurrency exceeds the provider's allowance. Graphiti is the biggest caller and has its **own** limit | Set `LLM_MAX_CONCURRENCY=1` **and** `GRAPHITI_SEMAPHORE_LIMIT=1`. The second one is the one people miss — `graphiti-core` defaults to 20 concurrent calls. `llm_usage.failures` on the job counts the retries |
@@ -608,9 +729,10 @@ of degraded modes is in
 | Run is very slow, logs show retries | Provider rate limiting | Lower `LLM_MAX_CONCURRENCY` to 2–3. Note this does **not** throttle the crawler any more — that is `HTTP_MAX_CONCURRENCY`, which costs no tokens |
 | `DataNotMatchException: {id} field should be a int64` | A `city_passages` collection from an earlier build has an Int64 primary key; passage ids are URL hashes | Fixed automatically now — the store validates the schema on init and recreates a mismatched collection. If you are on older code, delete `./data/milvus.db` |
 | Startup logs *"Milvus collection ... is unusable"* | The self-repair above just ran | Informational. Passage embeddings for already-researched cities were dropped and rebuild on the next run for those cities |
-| `FutureWarning: get_sentence_embedding_dimension ... renamed` | sentence-transformers 5.x renamed the method | Fixed; `embedding_dim()` now prefers `get_embedding_dimension` and falls back |
+| `Model sentence-transformers/... not found` from fastembed | `EMBEDDING_MODEL` is set to a name fastembed does not publish an ONNX build for | The default `all-MiniLM-L6-v2` is the supported one. `fastembed.TextEmbedding.list_supported_models()` prints the rest |
 | Log floods with *"Retrying _generate_response_with_retry"* | Graphiti's own entity extraction is being rate-limited | **This is the LLM provider, not Neo4j.** Graphiti runs several model calls per fact, so it is usually the largest LLM consumer and first to hit a free-tier quota. Check the Run Warnings for the fact-level count |
 | `ModuleNotFoundError: milvus_lite` | Native Windows | Run in Docker or WSL2, or point `MILVUS_URI` at a server |
-| First request hangs ~60s | Embedding model loading, which now happens at startup instead | Set `PREWARM_EMBEDDINGS=true` (the default). With it off, this is expected once per container start |
+| First request hangs ~60s | The embedding model is loading | Expected once per container start. Set `PREWARM_EMBEDDINGS=true` to move the load to startup instead — but read the memory warning in §4.1 first |
+| Container restarts in a loop shortly after start, with no traceback | Almost always an OOM kill during the embedding-model load, not a code fault — a killed process cannot log | Confirm the service's memory limit is above ~1.5 GB. If it is not, leave `PREWARM_EMBEDDINGS` unset so the load happens lazily, and expect the first research run to need that memory anyway |
 | Many sources DENIED | robots.txt or the ToS denylist | Working as intended — `/sources/{city}` lists each URL with its reason |
 | Container restart loop | Bad `.env` | `docker compose logs app`; stores are constructed lazily, so this is nearly always a parse error in `.env` itself |

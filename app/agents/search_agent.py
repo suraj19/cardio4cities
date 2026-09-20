@@ -13,21 +13,37 @@ That is not cosmetic: discovery is the one stage whose failure is otherwise
 indistinguishable from a genuine absence of information, because a run with
 no candidates and a run about an undocumented city produce the same gaps.
 
-Two forms of pruning happen here rather than downstream, because every
+Three forms of pruning happen here rather than downstream, because every
 surviving URL costs a robots.txt fetch, a page fetch and an LLM call:
 
   * URLs already seen in an earlier pass are dropped, so a retry cannot
     re-research what it already has.
+  * Domains on SOURCE_DOMAIN_DENYLIST are dropped, and if
+    SOURCE_DOMAIN_ALLOWLIST is set, everything outside it is too. This runs
+    *before* the cap below, so a result that was never going to be usable
+    cannot first consume one of the few slots a dimension is allowed.
   * Each dimension keeps at most MAX_SOURCES_PER_DIMENSION candidates, so
     one dimension with abundant coverage cannot crowd out the budget of a
     dimension with sparse coverage. Capping per dimension rather than in
     total is what keeps a five-dimension brief balanced.
+
+The allowlist is off by default and deliberately so. Restricting discovery to
+domains someone already trusted makes a demo fast and repeatable, but it also
+guarantees the brief can only contain what was expected of it, and the useful
+finding is usually the source nobody nominated. When it *is* set, the run says
+so in the report: gaps produced by a deliberately narrowed search would
+otherwise be indistinguishable from an absence of published information, which
+is the same confusion a silent search failure causes.
 """
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from app.config import settings
 from app.graph.state import CityResearchState
 from app.models.schemas import PlannedQuery, SourceCandidate
+from app.util import domain_matches, domain_of
+
+logger = logging.getLogger(__name__)
 
 
 def _mock_search(query: PlannedQuery, city: str) -> list[SourceCandidate]:
@@ -171,6 +187,20 @@ def _run_query(query: PlannedQuery, city: str) -> tuple[list[SourceCandidate], s
         return [], f"{provider} search failed ({type(exc).__name__}: {exc})."
 
 
+def _domain_permitted(domain: str) -> bool:
+    """Whether the domain policy allows this source to be considered.
+
+    Denylist first, so a domain on both lists is refused — the safer reading
+    of a contradictory configuration, and the only one that cannot be used to
+    smuggle a blocked source in by adding it to the allowlist.
+    """
+    if domain_matches(domain, settings.SOURCE_DOMAIN_DENYLIST):
+        return False
+    if settings.SOURCE_DOMAIN_ALLOWLIST:
+        return domain_matches(domain, settings.SOURCE_DOMAIN_ALLOWLIST)
+    return True
+
+
 def search_node(state: CityResearchState) -> dict:
     city = state["city"]
     queries: list[PlannedQuery] = state.get("planned_queries", [])
@@ -179,6 +209,7 @@ def search_node(state: CityResearchState) -> dict:
     per_dimension: dict[str, int] = {}
     deduped: list[SourceCandidate] = []
     failures: list[str] = []
+    rejected: dict[str, int] = {}
 
     # Queries run concurrently but are *consumed* in plan order below, which
     # is what `pool.map` guarantees and what the dedupe and per-dimension caps
@@ -205,14 +236,48 @@ def search_node(state: CityResearchState) -> dict:
         for candidate in results:
             if not candidate.url or candidate.url in seen_urls:
                 continue
+            # Before the cap, deliberately: a source the policy was never
+            # going to allow must not first consume one of the few slots its
+            # dimension is given.
+            domain = domain_of(candidate.url)
+            if not _domain_permitted(domain):
+                rejected[domain] = rejected.get(domain, 0) + 1
+                continue
             if per_dimension.get(candidate.dimension, 0) >= settings.MAX_SOURCES_PER_DIMENSION:
                 continue
             seen_urls.add(candidate.url)
             per_dimension[candidate.dimension] = per_dimension.get(candidate.dimension, 0) + 1
             deduped.append(candidate)
 
+    if rejected:
+        # Logged, not warned. Excluding a recipe blog is the policy working
+        # rather than the run degrading, and it does not belong in a brief a
+        # stakeholder reads — but it does belong somewhere, or a policy that
+        # is silently eating every result is indistinguishable from a search
+        # engine that found nothing.
+        logger.info(
+            "[%s] domain policy refused %d result(s): %s",
+            city,
+            sum(rejected.values()),
+            ", ".join(f"{d} x{n}" for d, n in sorted(rejected.items())),
+        )
+
     # dict.fromkeys collapses the repeats while preserving order.
     warnings = list(dict.fromkeys(failures))
+
+    if settings.SOURCE_DOMAIN_ALLOWLIST:
+        # The allowlist *must* be disclosed. Every gap in this brief is
+        # reported as "not established", and a narrowed search changes what
+        # that sentence means — from "nobody has published this" to "we only
+        # looked in these places". Leaving the reader to assume the first is
+        # the more damaging of the two possible silences.
+        warnings.append(
+            f"Source discovery was restricted to "
+            f"{len(settings.SOURCE_DOMAIN_ALLOWLIST)} configured domain(s): "
+            f"{', '.join(settings.SOURCE_DOMAIN_ALLOWLIST)}. Gaps below may "
+            f"reflect that restriction rather than an absence of published "
+            f"information about {city}."
+        )
     if queries and len(failures) == len(queries):
         # Total discovery failure needs saying separately, because the gaps it
         # produces are otherwise worded as though the research was done and

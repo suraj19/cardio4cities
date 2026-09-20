@@ -37,6 +37,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app import telemetry
 from app.config import settings
 from app.jobs import TERMINAL_STATES, registry
 from app.llm.client import llm_client
@@ -61,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 def _prewarm_embeddings() -> None:
-    """Load the sentence-transformers model before anyone asks for it.
+    """Load the local embedding model before anyone asks for it.
 
     ~60s on a cold container, and it used to land on the first request that
     touched the vector store or the graph — which during a demo reads as the
@@ -90,6 +91,10 @@ def _prewarm_embeddings() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before anything else in startup: FastAPI instrumentation has to attach
+    # to the app, and a node that runs before the tracer exists produces no
+    # span. Cheap and silent when OTEL_ENABLED is unset, which is the default.
+    telemetry.setup(app)
     if settings.PREWARM_EMBEDDINGS and not settings.is_mock:
         threading.Thread(
             target=_prewarm_embeddings, name="prewarm-embeddings", daemon=True
@@ -131,6 +136,35 @@ def _clean_city(city: str) -> str:
     if not city:
         raise HTTPException(status_code=400, detail="City must not be empty.")
     return city[:120]
+
+
+def _shared_dependency_hint(outages: list[str]) -> str:
+    """Name the embedding model when it is the thing both stores tripped over.
+
+    The vector store and the knowledge graph look independent — different
+    databases, different hosts — but they share one component: the local
+    embedding model. Milvus needs it to embed the question, and Graphiti's
+    retrieval embeds the question too, through the same LocalEmbedder. So a
+    model that cannot load takes out both at once and presents as two
+    unrelated outages, which sends the reader off checking two healthy
+    databases.
+
+    Detected by both failures carrying the same exception type, which is what
+    a shared dependency looks like from here.
+    """
+    if len(outages) < 2:
+        return ""
+    kinds = {failure.split("(")[-1].split(":")[0] for failure in outages}
+    if len(kinds) != 1:
+        return ""
+    return (
+        " Both failed the same way, which usually means the shared dependency "
+        "rather than either database: the local embedding model. It is "
+        "downloaded on first use, so check network egress to huggingface.co "
+        "(a TLS interception proxy shows up here as a certificate error) and "
+        "that `fastembed` is installed in the interpreter running uvicorn. "
+        "`python -m scripts.check_services` checks both."
+    )
 
 
 @app.get("/health")
@@ -320,6 +354,11 @@ async def ask(req: AskRequest):
     city = _clean_city(req.city)
 
     passages, graph_facts, degraded = [], [], []
+    # Kept separate from `degraded` because these two lists answer different
+    # questions. `degraded` tells a caller who got an answer what was missing
+    # from it; `outages` decides whether an empty result means "nothing has
+    # been researched" or "we could not look".
+    outages = []
     try:
         # Embedding the question is CPU-bound and local, so it also goes to a
         # worker thread rather than stalling the loop. The lambda matters:
@@ -328,17 +367,32 @@ async def ask(req: AskRequest):
         # would do that load on the event loop before the thread ever starts.
         passages = await asyncio.to_thread(lambda: vector_store.query(city, req.question))
     except Exception as exc:
+        outages.append(f"Vector store unavailable ({type(exc).__name__}: {exc}).")
         degraded.append(f"Vector store unavailable ({type(exc).__name__}).")
     try:
         graph_facts = await graph_store.query_facts_for_city(city, question=req.question, limit=8)
     except Exception as exc:
+        outages.append(f"Knowledge graph unavailable ({type(exc).__name__}: {exc}).")
         degraded.append(f"Knowledge graph unavailable ({type(exc).__name__}).")
 
     if not passages and not graph_facts:
+        # 503 rather than 404 when both stores raised. They are not the same
+        # situation and they need opposite responses: 404 tells the operator
+        # to go and research the city, which is wasted effort — and on a
+        # provider-metered key, expensive wasted effort — when the truth is
+        # that nothing could be read. Only an empty index is a 404.
+        if outages:
+            raise HTTPException(
+                status_code=503,
+                detail="Neither evidence store could be read, so this is an "
+                "outage rather than an empty index — researching the city "
+                "again will not help until it is fixed. "
+                + " ".join(outages)
+                + _shared_dependency_hint(outages),
+            )
         raise HTTPException(
             status_code=404,
-            detail=f"Nothing indexed for '{city}' yet — run /research first. "
-            + " ".join(degraded),
+            detail=f"Nothing indexed for '{city}' yet — run /research first.",
         )
 
     citations, blocks = [], []

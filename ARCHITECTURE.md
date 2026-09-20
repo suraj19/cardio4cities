@@ -251,7 +251,7 @@ returns **edges, not nodes**, because in Graphiti the edge *is* the fact
 
 Graphiti normally wants an OpenAI key for chat, embeddings and reranking. Here
 only chat is remote: `app/llm/embeddings.py` provides a local `EmbedderClient`
-and a cosine-similarity `CrossEncoderClient` off the same sentence-transformers
+and a cosine-similarity `CrossEncoderClient` off the same ONNX
 model. That decouples the graph from the chat provider entirely — providers with
 no `/embeddings` route work fine, and there is no second API key to manage.
 
@@ -347,7 +347,7 @@ selected independently.
 | Graph | in-memory adjacency lists | Neo4j Sandbox via Graphiti |
 | LLM | canned deterministic responses | any OpenAI-compatible chat endpoint |
 | Search | canned candidate URLs | Tavily, or `ddgs` without a key |
-| Embeddings | not used | local sentence-transformers |
+| Embeddings | not used | local fastembed / ONNX |
 
 **SQLite needs no configuration** and never branches on run mode. Swapping in
 Postgres is a `DATABASE_URL` change with no code edits.
@@ -449,7 +449,7 @@ covered rather than facts found, and the fact-checker grades each claim on
 independently cited corroboration. Both have teeth: the first drives the retry
 edge, the second decides whether a claim can be reported at all.
 
-**Offline, deterministic.** `tests/test_pipeline.py` runs the full nine-node
+**Offline, deterministic.** `tests/test_pipeline.py` runs the full ten-node
 graph in MOCK mode with no internet, keys or Neo4j, asserting the
 non-negotiables as contracts — the gate excludes denied URLs from extraction,
 every reportable fact's source URL appears in the report body, UNSUPPORTED

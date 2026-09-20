@@ -21,12 +21,36 @@ lxml==5.3.0
 # --- Datastores ---
 sqlalchemy==2.0.36            # relational store (SQLite by default, Postgres via DATABASE_URL)
 pymilvus==2.4.10              # vector store
-sentence-transformers==3.3.1  # local embeddings (no external API needed)
+fastembed==0.8.0              # local embeddings (no external API needed).
+                              # ONNX rather than sentence-transformers, which
+                              # would pull torch: same all-MiniLM-L6-v2
+                              # weights, ~1/3 the resident memory and ~2GB
+                              # less image. See app/llm/embeddings.py.
 neo4j==5.27.0                  # graph driver (graphiti-core needs >=5.26.0)
 graphiti-core==0.30.2          # temporal knowledge graph layer over Neo4j
 
 # --- LLM ---
 openai==1.109.1                # highest 1.x; graphiti-core needs >=1.91.0
+
+# --- Observability (inert unless OTEL_ENABLED=true) ---
+# Pure Python and a few MB, so they are pinned here rather than split into a
+# second requirements file: a feature that needs a different install to try
+# is a feature nobody tries. app/telemetry.py imports none of this until it
+# is switched on, and logs once and continues if it is switched on without
+# them — telemetry never stops a research run.
+opentelemetry-api==1.29.0
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-http==1.29.0   # OTLP/HTTP: Jaeger, Tempo,
+                                                 # Honeycomb, Datadog, Collector
+opentelemetry-instrumentation-fastapi==0.50b0    # server spans
+opentelemetry-instrumentation-requests==0.50b0   # page fetches, robots.txt,
+                                                 # WHO and World Bank
+opentelemetry-instrumentation-sqlalchemy==0.50b0 # the relational audit trail
+opentelemetry-instrumentation-threading==0.50b0  # carries trace context into
+                                                 # the worker pools. Without it
+                                                 # every LLM call started inside
+                                                 # one becomes its own root
+                                                 # trace - ~150 orphans a city.
 
 # --- Testing ---
 pytest==8.3.4

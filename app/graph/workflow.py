@@ -44,6 +44,7 @@ from langgraph.graph import StateGraph, END
 
 from app.config import settings
 from app.graph.state import CityResearchState
+from app.telemetry import record_node_duration, span
 from app.agents.planner import planner_node
 from app.agents.query_gen import query_gen_node
 from app.agents.search_agent import search_node
@@ -134,19 +135,39 @@ def _timed(name: str, node):
         job = _job_of(config)
         if job is not None:
             job.stage_finished(name, seconds, summary)
+        return seconds
 
+    # The span wraps the node rather than sitting inside `_before`/`_after`,
+    # because a context manager is the only shape that still closes when the
+    # node raises — and it is the raising runs that are worth looking at.
+    # Everything the log line says goes on the span too, so a trace and a log
+    # of the same run cannot disagree.
     if inspect.iscoroutinefunction(node):
         async def wrapper(state, config=None):
-            started = _before(state, config)
-            result = await node(state)
-            _after(state, config, started, result)
-            return result
+            with span(f"node.{name}", **{
+                "cardio4cities.node": name,
+                "cardio4cities.city": state.get("city"),
+                "cardio4cities.pass": state.get("pass_number"),
+            }) as current:
+                started = _before(state, config)
+                result = await node(state)
+                seconds = _after(state, config, started, result)
+                current.set_attribute("cardio4cities.node.summary", _summarise(result))
+                record_node_duration(name, seconds)
+                return result
     else:
         def wrapper(state, config=None):
-            started = _before(state, config)
-            result = node(state)
-            _after(state, config, started, result)
-            return result
+            with span(f"node.{name}", **{
+                "cardio4cities.node": name,
+                "cardio4cities.city": state.get("city"),
+                "cardio4cities.pass": state.get("pass_number"),
+            }) as current:
+                started = _before(state, config)
+                result = node(state)
+                seconds = _after(state, config, started, result)
+                current.set_attribute("cardio4cities.node.summary", _summarise(result))
+                record_node_duration(name, seconds)
+                return result
 
     wrapper.__name__ = f"timed_{name}"
     return wrapper

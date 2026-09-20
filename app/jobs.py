@@ -49,6 +49,7 @@ from app.config import settings
 from app.graph.workflow import NODES, WORKFLOW_CONFIG, workflow
 from app.llm.usage import UsageSnapshot, ledger
 from app.models.schemas import ConfidenceTier, CrawlVerdict
+from app.telemetry import span
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,23 @@ class JobRegistry:
         return job, True
 
     async def _run(self, job: Job) -> None:
+        # The root span for the whole run. It has to be created here rather
+        # than in the request handler, because the request returns a job id
+        # in milliseconds and the work outlives it by minutes — tracing it
+        # from the handler would produce a trace that ends before the run
+        # starts. Everything downstream nests under this: ten nodes, the
+        # model calls inside them, and the store round trips inside those.
+        with span(
+            f"research {job.city}",
+            **{
+                "cardio4cities.city": job.city,
+                "cardio4cities.country": job.country,
+                "cardio4cities.job_id": job.job_id,
+            },
+        ) as run_span:
+            await self._run_traced(job, run_span)
+
+    async def _run_traced(self, job: Job, run_span) -> None:
         try:
             # Queued until a slot frees up, and visibly so — a job waiting
             # behind another run is a normal state, not a stall, and the
@@ -243,6 +261,8 @@ class JobRegistry:
                     job.error = f"{type(exc).__name__}: {exc}"
                     job.finished_at = time.time()
                     job.abandon_running_stages()
+                    run_span.record_exception(exc)
+                    run_span.set_attribute("cardio4cities.job.state", FAILED)
                     logger.exception(
                         "[%s] research job %s failed", job.city, job.job_id
                     )
@@ -252,9 +272,20 @@ class JobRegistry:
                         job.usage = (
                             ledger.snapshot() - job._usage_before
                         ).as_dict()
+                        # Put on the root span so the cost of a run is
+                        # readable without opening its children. This is the
+                        # number anyone asks for first.
+                        run_span.set_attributes(
+                            {
+                                f"cardio4cities.usage.{key}": value
+                                for key, value in job.usage.items()
+                                if isinstance(value, (int, float, str, bool))
+                            }
+                        )
 
                 job.state = SUCCEEDED
                 job.finished_at = time.time()
+                run_span.set_attribute("cardio4cities.job.state", SUCCEEDED)
                 logger.info(
                     "[%s] research job %s finished in %.1fs",
                     job.city,

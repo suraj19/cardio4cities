@@ -15,6 +15,10 @@ meeting.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design record: nodes, memory, stores,
   trade-offs, and what was cut
+- [docs/WALKTHROUGH_CURRENT.md](docs/WALKTHROUGH_CURRENT.md) — every component
+  of the application, in the order a request travels through it
+- [docs/WALKTHROUGH_BASELINE.md](docs/WALKTHROUGH_BASELINE.md) — the same
+  walkthrough for the previous version, with each change and its reason
 - [docs/PRESENTATION.md](docs/PRESENTATION.md) — the 7-slide deck
 - [examples/](examples/) — a generated city brief
 
@@ -55,7 +59,7 @@ Run the offline test suite — no keys, no internet, no Neo4j:
 RUN_MODE=MOCK pytest -v
 ```
 
-It runs the full nine-node graph and asserts the non-negotiables as contracts,
+It runs the full ten-node graph and asserts the non-negotiables as contracts,
 including that a total loss of internet still yields an honest all-gaps brief
 rather than an error. What it does and does not prove is set out in
 [ARCHITECTURE.md](ARCHITECTURE.md#how-this-is-evaluated), alongside the
@@ -132,21 +136,27 @@ schema. Nothing in them is a judgement, which is why they also run at
 `LLM_BULK_REASONING_EFFORT=none` — thinking tokens bill at the **output**
 rate, so effort is a cost setting rather than a quality dial.
 
-Defaults are `mistral-medium-latest` for judgement and `mistral-small-latest`
-for bulk. On the free Experiment plan that is **$0**; on a paid key it is
-roughly **$0.40 per city**.
+Both default to **`mistral-small-latest`**, which is Mistral's only
+**open-weight** model — Apache 2.0, weights published — so the entire pipeline
+runs on something a reader can inspect, self-host or audit. Sharing a model
+does not collapse the split: it moves to the thinking budget, `high` for the
+~30 judgement calls and `none` for the ~120 bulk ones. One model, two efforts.
+On the free Experiment plan that is **$0**; on a paid key, about **$0.12 per
+city**.
 
-> **On a paid key, change `LLM_MODEL` to `mistral-large-latest`** — Large 3 is
-> both stronger and ~3× cheaper than Medium 3.5 ($0.50/$1.50 per 1M against
-> $1.50/$7.50), taking a run to about **$0.19**. The default is Medium only
-> because **Large 3 is not served on the free tier**: it is absent from
-> `GET /v1/models` for a free key and returns `403 tier_not_allowed`.
+> **On a paid key, `mistral-large-latest` is the judgement upgrade** — and it
+> is also ~3× cheaper than Medium 3.5 ($0.50/$1.50 per 1M against $1.50/$7.50),
+> so the name order is misleading. Two caveats: Large is **not served on the
+> free tier** (absent from `GET /v1/models`, returns `403 tier_not_allowed`),
+> and it does **not** implement `reasoning_effort` — so blank
+> `LLM_REASONING_EFFORT` in the same change or every judgement call 400s.
+> Both Medium and Large are closed-weight.
 
 > **Mistral's free tier is the only one that can finish a city.** It gives you
 > **1B tokens/month** against the 400–600k a run consumes, so you are
 > throttled on request *rate* and never walled on volume — a slow run still
 > produces a brief. Compare Gemini's free tier at **20 requests/day** (one
-> city needs 150–250) or Groq's at **100k tokens/day** (about a fifth of one
+> city needs 150–250) or Groq's at **200k tokens/day** (about half of one
 > city); both stop mid-run and wait 24 hours. `RUN_MODE=MOCK` needs no key at
 > all.
 
@@ -169,9 +179,65 @@ the Experiment plan (phone verification, no card) in the Admin Console.
 | **Mistral** (default) | `https://api.mistral.ai/v1` | Only viable free tier. `mistral-large-latest` is **paid-tier only**; bulk runs `reasoning_effort=none` |
 | DeepSeek | `https://api.deepseek.com/v1` | No free tier, but **no RPM/TPM/RPD at all** — just 2500 concurrency, the best shape for this burst workload. ~$0.13/city |
 | Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-3.5-flash` / `gemini-3.1-flash-lite` at `low` / `minimal`. Tier 1 works (~$0.45/city); free tier does not |
-| Groq | `https://api.groq.com/openai/v1` | Fast, but **rejects** `reasoning_effort`. Avoid models below ~30B — structured extraction degrades sharply |
+| Groq | `https://api.groq.com/openai/v1` | Fastest tokens/sec here, but the free tier is **200k tokens/day** — half a city. Llama is Enterprise-only now; the self-serve models are `openai/gpt-oss-120b` / `-20b` and `qwen/qwen3.8-27b`. **Only Qwen accepts `reasoning_effort=none`**; gpt-oss accepts `low`/`medium`/`high` only, so bulk extraction cannot stop paying for reasoning. JSON mode additionally needs `reasoning_format` set to `hidden` on Qwen |
 | OpenAI | `https://api.openai.com/v1` | Paid |
-| Ollama (self-hosted) | `http://host.docker.internal:11434/v1` | Unmetered and keyless. Same size caveat as Groq |
+| **Ollama** (local) | `http://localhost:11434/v1` | **No rate limit and no key.** Costs wall-clock instead of quota. See below |
+
+### Running the whole pipeline locally with Ollama
+
+The only configuration with **no rate limit at all**. A city is 150–250 calls,
+and every hosted free tier meters that somewhere; here the only budget is your
+own machine's time. No API key is involved at any point.
+
+```bash
+ollama pull qwen3:8b
+
+# Windows PowerShell
+$env:OLLAMA_CONTEXT_LENGTH=32768; ollama serve
+# macOS / Linux
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+```
+
+Then in `.env` — leave `LLM_API_KEY` empty, and comment out the
+`LLM_REASONING_EFFORT` line:
+
+```bash
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen3:8b
+LLM_BULK_MODEL=qwen3:8b
+LLM_BULK_REASONING_EFFORT=none
+```
+
+Confirm it before running a city — the preflight calls both profiles and reads
+the server's real context window:
+
+```bash
+python -m scripts.check_services
+```
+
+Three things are worth knowing before you rely on this:
+
+- **`OLLAMA_CONTEXT_LENGTH` is not optional.** Ollama defaults to a small
+  window and **truncates** longer prompts instead of refusing them. Graphiti's
+  entity-extraction prompts are past 4k, so the default gives you a run that
+  completes, writes a knowledge graph with **no fact edges**, and reports no
+  error anywhere. The OpenAI-compatible API has no way to set context size per
+  request, so it must be set on the server — which is why
+  `check_services` probes `/api/ps` and fails the check when it is under 32768.
+- **Unmetered is not fast.** 150–250 calls against a local 8B model is tens of
+  minutes on a GPU and hours on CPU. This is survivable only because a run is
+  a background job you poll — the same change that fixed the Railway timeout.
+- **Quality drops with model size.** 8B runs the whole pipeline on a normal
+  laptop, but extraction is weaker than hosted Small 4 and the brief will be
+  thinner. `qwen3:30b` or `gpt-oss:20b` are closer if you have the memory.
+  Below ~7B, structured extraction starts inventing fields.
+
+No API key is required because `LLM_BASE_URL` resolves to a local host —
+`Settings.llm_is_local` in `app/config.py`. Both reasoning-effort settings also
+default to empty in that case, since LM Studio and llama.cpp are reached the
+same way and do not all implement the field. This is a **local path only**: a
+Railway free-tier container has 0.5 GB of RAM and cannot host a model, so
+deployments keep using a hosted provider.
 
 Three settings break a provider switch outright if you get them wrong:
 
@@ -191,11 +257,146 @@ Every finished job reports `llm_usage` with calls and tokens **per model**,
 which is how you confirm the split is actually in effect: all ~150 calls
 landing on one model means the bulk setting is not being used.
 
-**Embeddings are generated locally** by sentence-transformers, shared between
+**Embeddings are generated locally** by fastembed (ONNX), shared between
 Milvus and Graphiti's embedder *and* its reranker. That is deliberate: the
 provider only has to serve chat completions, so chat-only APIs work without a
 second key, and it removes a failure mode — Graphiti's default `OpenAIEmbedder`
 pointed at a provider with no `/embeddings` route fails on every graph write.
+
+## Observability (OpenTelemetry)
+
+A city is 150–250 model calls across ten nodes and three datastores. When a
+brief comes back thin, the question is always *which part gave up* — and the
+pipeline already measured itself, but only after the run, only in-process, and
+only if you went looking. Tracing turns the same measurements into something
+you can open.
+
+Off by default. The fastest way to see it, with no collector to run:
+
+```bash
+OTEL_ENABLED=true OTEL_CONSOLE_EXPORT=true uvicorn app.main:app
+```
+
+Or ship to anything speaking OTLP/HTTP — Jaeger, Grafana Tempo, Honeycomb,
+Datadog, an OpenTelemetry Collector:
+
+```bash
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one
+# .env
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+### An LLM-native dashboard — Opik or Langfuse
+
+Both ingest OTLP over HTTP natively, so either is **configuration only, no
+code change**. Set `OTEL_ENABLED=true` and two more variables.
+
+**Opik** (Comet). Self-hosting is free — `./opik.sh`, UI on `localhost:5173`:
+
+```bash
+# Cloud
+OTEL_EXPORTER_OTLP_ENDPOINT=https://www.comet.com/opik/api/v1/private/otel
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=<api-key>,projectName=cardio4cities,Comet-Workspace=<workspace>
+
+# Self-hosted — no headers needed
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:5173/api/v1/private/otel
+```
+
+**Langfuse.** Auth is Basic, built from the two project keys:
+
+```bash
+# AUTH=$(printf '%s' 'pk-lf-...:sk-lf-...' | base64 -w0)
+OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel   # EU
+# https://us.cloud.langfuse.com/api/public/otel                          # US
+# http://localhost:3000/api/public/otel                                  # self-hosted
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <AUTH>,x-langfuse-ingestion-version=4
+```
+
+Langfuse reads the `gen_ai.*` attributes this project already emits and turns
+those spans into *generations* with model, token and cost figures, nesting the
+node spans around them as observations. So the semantic conventions used in
+`app/llm/client.py` are not decoration — they are what makes the dashboard
+understand the trace.
+
+Three things worth knowing before you point either at it:
+
+- **Both require OTLP over HTTP, not gRPC.** This project already uses
+  `opentelemetry-exporter-otlp-proto-http`, so that is already right. A test
+  pins the exact trace URL the exporter builds against the one Opik
+  documents.
+- **Turn on `OTEL_CAPTURE_CONTENT=true`, or the dashboard will look broken.**
+  Prompts and completions are not recorded by default, because they contain
+  scraped third-party page content. For these tools the prompt/completion
+  pair *is* the product, so with the flag off you get a correct trace tree
+  with timings and token counts and an empty panel on every span — which
+  reads as a failed integration rather than a deliberate default. This is a
+  real decision, not a formality: turning it on copies page content into a
+  third-party service. `OTEL_CAPTURE_CONTENT_CHARS` (default 4000) caps each
+  field.
+- **Metrics switch off automatically** for both, because both ingest traces
+  only. Deriving the metrics URL from the shared endpoint the way the OTel
+  convention says to would POST every 60 seconds to something that can never
+  accept it — a steady drip of export errors while traces arrive perfectly,
+  which is a confusing thing to debug. Set
+  `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to send metrics somewhere that wants
+  them.
+
+Opik also has a native `OpikTracer` LangGraph callback, which is richer — it
+captures each node's input and output state automatically and unlocks Opik's
+evaluation features. It is also a second, parallel instrumentation path, it
+would upload full node state (scraped page bodies included) with no
+equivalent of the content flag, and with `ainvoke` it needs explicit context
+propagation. The OTLP route reuses the instrumentation that is already tested
+here, so it is the one this README recommends. Reach for `OpikTracer` if what
+you want is Opik's *evaluation* side — scoring brief quality across runs,
+comparing prompt versions — which tracing alone will not give you.
+
+One run is **one trace**, and it looks like this (real output, MOCK mode):
+
+```
+research Springfield                             151.3 ms
+  node.planner                                     0.1 ms
+  node.query_gen                                   0.7 ms
+    chat mistral-small-latest                      0.4 ms
+  node.extraction                                  3.9 ms
+    chat mistral-small-latest   x10
+  node.fact_check                                  4.5 ms
+    chat mistral-small-latest   x12
+  node.graph_writer                              115.4 ms      <- 76% of the run
+  node.report                                      8.2 ms
+```
+
+That last line is the point. "graph_writer is the slow one because Graphiti
+re-extracts entities for every fact" is a claim in this README; on a trace it
+is a measurement, and each of those extractions is a child span you can open.
+
+| Instrumented | How |
+|---|---|
+| The whole run | Root span, created in `app/jobs.py` — not in the request handler, which returns a job id in milliseconds while the work runs for minutes |
+| The ten nodes | `workflow._timed`, carrying the same summary string the log line prints, so a trace and a log of one run cannot disagree |
+| Every model call | GenAI semantic conventions (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, …), one span per call **including its retries**, each attempt an event — a rate-limited call that succeeded on its fourth attempt after 30s of backoff is the thing you most want to see |
+| Every embedding batch | The component both evidence stores share; see below |
+| Milvus and Neo4j | `milvus.search`, `milvus.upsert`, `graphiti.search`, `graphiti.add_episode` |
+| Outbound HTTP, FastAPI, SQLAlchemy | Auto-instrumentation |
+
+**Prompts and completions are deliberately not recorded.** They carry scraped
+page content, and a trace backend is not a place to put that. Spans carry
+lengths and token counts; the tests assert no attribute is long enough to be
+content.
+
+Two implementation notes worth knowing:
+
+- **Thread context propagation is not optional.** Extraction, fact-checking,
+  crawlability and search all fan out across `ThreadPoolExecutor`s, and trace
+  context is a contextvar — asyncio tasks inherit it, threads do not. Without
+  `opentelemetry-instrumentation-threading`, every model call made inside a
+  pool starts its own root trace: ~150 orphans per city. The suite asserts a
+  run is exactly one trace, which is how this was caught.
+- **MOCK runs are traced too**, with `gen_ai.system=mock`, so the trace shape
+  is identical offline. That is what makes the instrumentation testable with
+  no keys and no collector — a MOCK trace missing a span is how you find a
+  call site nobody instrumented.
 
 ## API
 
@@ -247,7 +448,7 @@ app/
   stores/graph_store.py        Neo4j + Graphiti, read and written
   stores/lazy.py               shared connect-on-first-use proxy
   llm/client.py                OpenAI-compatible chat client, retrying
-  llm/embeddings.py            local sentence-transformers, shared
+  llm/embeddings.py            local ONNX embeddings, shared
   llm/json_utils.py            tolerant parsing of "ONLY JSON" responses
   util.py                      url → domain, shared by three layers
 frontend/index.html          single-page UI, served by FastAPI itself

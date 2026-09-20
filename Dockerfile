@@ -8,19 +8,25 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# HF_HOME deliberately sits outside /app/data: that path is a mounted volume at
-# runtime, which would shadow the model baked in below and send the first
-# request off to re-download it.
+# Both cache paths deliberately sit outside /app/data: that path is a mounted
+# volume at runtime, which would shadow the model baked in below and send the
+# first request off to re-download it. FASTEMBED_CACHE_PATH is set explicitly
+# rather than left to default, because fastembed's default location has moved
+# between releases and a cache miss here is a silent download on the first
+# request — exactly what baking the model was meant to prevent.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HF_HOME=/opt/hf-cache
+    HF_HOME=/opt/hf-cache \
+    FASTEMBED_CACHE_PATH=/opt/fastembed-cache
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Bake the embedding model into the image so the first request doesn't stall
-# on a ~90MB download, and so the container works without outbound HF access.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# on a download, and so the container works without outbound HF access. The
+# id is the full repo name because that is what fastembed resolves against;
+# the app accepts the short form too (see app/llm/embeddings.py).
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2')"
 
 COPY app ./app
 COPY frontend ./frontend

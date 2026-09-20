@@ -77,6 +77,39 @@ fenced blocks. Styling uses UnoCSS utility classes inline.
 
 Full syntax reference: https://sli.dev/guide/syntax
 
+## Checking that slides actually fit — run this after editing
+
+Slidev renders onto a fixed 16:9 canvas and **does not shrink content to fit
+it**. Anything past the bottom edge is simply not drawn, and nothing warns
+you: the markdown looks complete while the presentation quietly loses the last
+three bullets. This deck had 31 slides in that state.
+
+```bash
+python check_overflow.py          # report
+python check_overflow.py --fix    # write zoom: into the slides that need it
+```
+
+It parses `slides.md` the way Slidev does, estimates each slide's rendered
+height from the values in `style.css`, and compares that against the canvas.
+`--fix` writes a per-slide `zoom:` — Slidev's supported mechanism for this —
+which preserves every word and changes no slide numbering.
+
+It refuses to go below `zoom: 0.65` and reports those slides for splitting
+instead, because past that point the slide has more content than scaling can
+rescue and the honest fix is to cut it in two.
+
+**Run it before `npm run export`.** The `overflow-y: auto` fallback in
+`style.css` lets an over-tall slide scroll in the browser, which hides the
+problem interactively — but a PDF page cannot scroll, so anything relying on
+that fallback is lost in the export.
+
+Two caveats. The height is an *estimate*: it models type scale, margins,
+wrapping, table rows and code chrome, not glyph metrics, so read it as "this
+slide is 40% too tall" rather than a pixel count. And it is calibrated to
+over-report, because a false positive costs a glance and a false negative
+costs content in front of an audience. If you change `style.css`, update the
+constants at the top of the script to match.
+
 ## Relationship to `docs/PRESENTATION.md`
 
 `docs/PRESENTATION.md` is the same 7-slide narrative in Marp, and it reads

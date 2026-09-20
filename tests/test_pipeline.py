@@ -603,6 +603,124 @@ def test_missing_html_parser_is_named_once_not_per_source(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Source domain policy: what discovery is allowed to consider
+# ---------------------------------------------------------------------
+def _search_with(monkeypatch, urls: list[str]) -> dict:
+    """Run search_node against a provider that returns exactly `urls`."""
+    from app.agents import search_agent
+    from app.models.schemas import PlannedQuery, SourceCandidate
+
+    monkeypatch.setattr(
+        search_agent,
+        "_run_query",
+        lambda query, city: (
+            [
+                SourceCandidate(url=u, title="t", snippet="s", dimension="cv_burden")
+                for u in urls
+            ],
+            None,
+        ),
+    )
+    return search_agent.search_node(
+        {
+            "city": "Pune",
+            "planned_queries": [PlannedQuery(text="q", dimension="cv_burden")],
+            "candidates": [],
+        }
+    )
+
+
+def test_uncitable_domains_are_dropped_before_the_per_dimension_cap(monkeypatch):
+    """A video or social result is not evidence for a health brief, and if it
+    were merely dropped later it would still have eaten one of the two source
+    slots the dimension gets."""
+    from app.agents import search_agent
+
+    monkeypatch.setattr(search_agent.settings, "MAX_SOURCES_PER_DIMENSION", 2)
+    result = _search_with(
+        monkeypatch,
+        [
+            "https://www.youtube.com/watch?v=uRY4KZJiwEc",
+            "https://reddit.com/r/india/comments/x",
+            "https://nhm.maharashtra.gov.in/np-ncd",
+            "https://timesofindia.indiatimes.com/city/pune/screening",
+        ],
+    )
+    kept = [c.url for c in result["candidates"]]
+
+    assert len(kept) == 2, "the junk results consumed the dimension's budget"
+    assert all("youtube" not in u and "reddit" not in u for u in kept)
+
+
+def test_allowlist_restricts_discovery_and_says_so(monkeypatch):
+    """Narrowing the search changes what every 'not established' gap in the
+    brief means, so it cannot be applied silently."""
+    from app.agents import search_agent
+
+    monkeypatch.setattr(
+        search_agent.settings, "SOURCE_DOMAIN_ALLOWLIST", ("gov.in", "who.int")
+    )
+    result = _search_with(
+        monkeypatch,
+        [
+            "https://nhm.maharashtra.gov.in/np-ncd",
+            "https://www.who.int/india/health-topics/hypertension",
+            "https://timesofindia.indiatimes.com/city/pune/screening",
+        ],
+    )
+    kept = [c.url for c in result["candidates"]]
+
+    assert len(kept) == 2
+    assert not any("indiatimes" in u for u in kept)
+    disclosure = [w for w in result["warnings"] if "restricted to" in w]
+    assert disclosure, "a narrowed search must be disclosed in the report"
+    assert "gov.in" in disclosure[0]
+
+
+def test_no_allowlist_means_open_discovery_and_no_disclosure(monkeypatch):
+    """The default has to stay open: the useful source is usually the one
+    nobody would have nominated."""
+    from app.agents import search_agent
+
+    monkeypatch.setattr(search_agent.settings, "SOURCE_DOMAIN_ALLOWLIST", ())
+    monkeypatch.setattr(search_agent.settings, "MAX_SOURCES_PER_DIMENSION", 4)
+    result = _search_with(
+        monkeypatch,
+        [
+            "https://thriveindia.org/pune-recognition",
+            "https://nhm.maharashtra.gov.in/np-ncd",
+        ],
+    )
+
+    assert len(result["candidates"]) == 2
+    assert not any("restricted to" in w for w in result["warnings"])
+
+
+def test_domain_matching_respects_the_dot_boundary():
+    """A plain endswith would let evilgov.in pass as gov.in, which turns an
+    allowlist from a policy into a suggestion."""
+    from app.util import domain_matches
+
+    assert domain_matches("nhm.maharashtra.gov.in", ("gov.in",))
+    assert domain_matches("gov.in", ("gov.in",))
+    assert not domain_matches("evilgov.in", ("gov.in",))
+    assert not domain_matches("gov.in.example.com", ("gov.in",))
+
+
+def test_denylist_wins_over_allowlist(monkeypatch):
+    """The safer reading of a contradictory config, and the only one that
+    cannot be used to smuggle a blocked source past the denylist."""
+    from app.agents import search_agent
+
+    monkeypatch.setattr(
+        search_agent.settings, "SOURCE_DOMAIN_ALLOWLIST", ("youtube.com",)
+    )
+    result = _search_with(monkeypatch, ["https://youtube.com/watch?v=abc"])
+
+    assert result["candidates"] == []
+
+
+# ---------------------------------------------------------------------
 # Fetching: what we agree to read, and with which parser
 # ---------------------------------------------------------------------
 _FEED = (
@@ -1051,6 +1169,116 @@ def test_reasoning_effort_is_sent_when_configured(monkeypatch):
     client.complete("sys", "user")
 
     assert recorder.kwargs["reasoning_effort"] == "low"
+
+
+# ---------------------------------------------------------------------------
+# Running inference locally (Ollama / LM Studio / llama.cpp)
+# ---------------------------------------------------------------------------
+
+
+def test_a_local_model_server_does_not_require_an_api_key(monkeypatch):
+    """Ollama and LM Studio ignore the Authorization header — Ollama's own
+    docs call the api_key "required but ignored". Demanding a key for them
+    turns a correct setup into a startup error telling the operator to fetch a
+    key that does not exist."""
+    from app.config import Settings
+
+    local = Settings()
+    for url in (
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:1234/v1",
+        "http://host.docker.internal:11434/v1",
+        "http://workstation.local:11434/v1",
+    ):
+        monkeypatch.setattr(local, "LLM_BASE_URL", url)
+        assert local.llm_is_local, f"{url} should be recognised as local"
+
+    for url in (
+        "https://api.mistral.ai/v1",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "https://api.groq.com/openai/v1",
+    ):
+        monkeypatch.setattr(local, "LLM_BASE_URL", url)
+        assert not local.llm_is_local, f"{url} must still require a key"
+
+
+def test_a_keyless_local_endpoint_builds_a_client_and_a_remote_one_does_not(
+    monkeypatch,
+):
+    """The two halves of the same rule, because relaxing the key requirement
+    is only safe if it stays relaxed for local URLs alone. A remote endpoint
+    with no key must still fail loudly at the client rather than three minutes
+    later as a 401 inside a node."""
+    from app.llm.client import LLMClient
+
+    monkeypatch.setattr("app.llm.client.settings.LLM_API_KEY", "")
+    monkeypatch.setattr(
+        "app.llm.client.settings.LLM_BASE_URL", "http://localhost:11434/v1"
+    )
+    # Constructed, not called: this proves the guard lets it through without
+    # reaching the network.
+    assert LLMClient()._get_client() is not None
+
+    monkeypatch.setattr(
+        "app.llm.client.settings.LLM_BASE_URL", "https://api.mistral.ai/v1"
+    )
+    with pytest.raises(ValueError, match="LLM_API_KEY is required"):
+        LLMClient()._get_client()
+
+
+def test_pointing_at_a_local_server_stops_sending_reasoning_effort(monkeypatch):
+    """Ollama accepts `reasoning_effort`, but LM Studio and llama.cpp are
+    reached the same way and do not all implement it — and on a local server
+    thinking costs wall-clock rather than money, which is the trade the
+    judgement/bulk split was making. So the default flips to absent.
+
+    Asserted by reloading config under a patched environment because these
+    defaults are evaluated once, in the class body, at import.
+    """
+    import importlib
+    import os
+
+    import dotenv
+
+    import app.config
+
+    # Neutralised for the duration: reloading app.config calls load_dotenv
+    # again, which would read the developer's own .env back over the
+    # environment set up below and make this test pass or fail depending on
+    # whose machine it runs on.
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+
+    before = {
+        key: os.environ.get(key)
+        for key in ("LLM_BASE_URL", "LLM_REASONING_EFFORT", "LLM_BULK_REASONING_EFFORT")
+    }
+    try:
+        os.environ["LLM_BASE_URL"] = "http://localhost:11434/v1"
+        os.environ.pop("LLM_REASONING_EFFORT", None)
+        os.environ.pop("LLM_BULK_REASONING_EFFORT", None)
+        local = importlib.reload(app.config).settings
+        assert local.llm_is_local
+        assert local.LLM_REASONING_EFFORT == ""
+        assert local.LLM_BULK_REASONING_EFFORT == ""
+
+        # The complement: the hosted default is unchanged.
+        os.environ["LLM_BASE_URL"] = "https://api.mistral.ai/v1"
+        hosted = importlib.reload(app.config).settings
+        assert hosted.LLM_REASONING_EFFORT == "high"
+        assert hosted.LLM_BULK_REASONING_EFFORT == "none"
+    finally:
+        # Restored by hand rather than with monkeypatch: the module object is
+        # shared, so leaving it reloaded against a stray env would silently
+        # re-point every test that imported `settings` before this one.
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        # Undone before the restoring reload so that reload behaves normally;
+        # monkeypatch's own teardown would otherwise run after it.
+        monkeypatch.undo()
+        importlib.reload(app.config)
 
 
 def test_recursion_limit_covers_every_pass_the_retry_budget_allows():

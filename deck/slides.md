@@ -95,10 +95,11 @@ layout: default
 ---
 
 # 2 · The solution — a verification pipeline
+ 
+<div class="flex justify-center my-2">
+  <div class="w-full max-w-4xl text-xs flex justify-center my-2">
 
-<div class="text-sm">
-
-```mermaid {scale: 0.62}
+```mermaid {scale: 0.48}
 flowchart LR
   subgraph DISCOVER["Discover"]
     P[planner] --> Q[query_gen] --> S[search] --> O[official_data]
@@ -121,23 +122,23 @@ flowchart LR
   style VERIFY fill:#dbeafe,stroke:#3b82f6
   style Z fill:#dcfce7,stroke:#22c55e
 ```
-
+ 
+  </div>
 </div>
-
-<div class="grid grid-cols-4 gap-3 text-xs pt-2">
-<div class="p-3 rounded bg-gray-100 dark:bg-gray-800">
-<b>10 agents</b><br/>LangGraph <code>StateGraph</code>, one conditional edge, every node idempotent under retry
+<div class="text-xs opacity-70 text-center">
+Nine agents in a loop. The <span class="text-red-500 font-semibold">permission gate</span> and the
+<span class="text-blue-500 font-semibold">verify step</span> are what make it a pipeline rather than a summariser.
 </div>
-<div class="p-3 rounded bg-red-50 dark:bg-red-900/20">
-<b>Permission first</b><br/>Nothing is fetched before the gate rules on it — enforced structurally, not by routing
-</div>
-<div class="p-3 rounded bg-blue-50 dark:bg-blue-900/20">
-<b>Independent check</b><br/>The checker never learns which source produced the claim it is judging
-</div>
-<div class="p-3 rounded bg-green-50 dark:bg-green-900/20">
-<b>3 datastores</b><br/>Relational audit, vector recall, temporal graph — read back at query time
-</div>
-</div>
+<!--
+Walk it left to right once, then make the two points that matter:
+1. The red block is a hard gate - we check robots.txt and terms before we
+   read anything. Nothing downstream ever sees a page we were not allowed
+   to fetch.
+2. The blue block is why this is not a summariser. Extraction pulls claims,
+   fact_check independently re-verifies each one against its source.
+Then the loop: if coverage is insufficient we re-plan against the gaps
+rather than padding the brief.
+-->
 
 <!--
 Walk left to right. The shape of the pipeline is the argument: discovery is
@@ -197,6 +198,7 @@ query generator and claim extractor are told the dimension means.
 
 ---
 layout: default
+zoom: 0.88
 ---
 
 # 4 · Trust and evidence — four mechanisms
@@ -260,6 +262,7 @@ consequence is enforced in graph_writer_agent, not in the checker itself.
 
 ---
 layout: default
+zoom: 0.9
 ---
 
 # 5 · Knowledge management — three stores, three questions
@@ -513,7 +516,7 @@ endpoints, not just written to.
 layout: default
 ---
 
-# The complete toolchain
+# The complete toolchain <span class="text-sm opacity-60">1 of 2 — orchestration, search, crawl</span>
 
 <div class="grid grid-cols-2 gap-5 text-xs">
 <div>
@@ -538,6 +541,22 @@ layout: default
 | `urllib.robotparser` | stdlib robots.txt evaluation |
 
 </div>
+</div>
+
+<!--
+Note what is *not* here: no LangChain agents, no vendor SDK for the model, no
+embedding API, no scraping framework. The openai package is used purely as a
+protocol client.
+-->
+
+---
+layout: default
+zoom: 0.94
+---
+
+# The complete toolchain <span class="text-sm opacity-60">2 of 2 — stores, AI, services</span>
+
+<div class="grid grid-cols-2 gap-5 text-xs">
 <div>
 
 ### Datastores
@@ -552,7 +571,11 @@ layout: default
 | Tool | Role |
 |---|---|
 | `openai 1.109` | **client only** — any OpenAI-compatible endpoint |
-| `sentence-transformers` | local `all-MiniLM-L6-v2` embeddings |
+| `fastembed` (ONNX) | local `all-MiniLM-L6-v2` embeddings |
+| `opentelemetry-*` | optional tracing; off unless `OTEL_ENABLED` |
+
+</div>
+<div>
 
 ### External services (no code)
 | Service | Role |
@@ -565,21 +588,19 @@ layout: default
 </div>
 
 <div class="pt-2 text-xs opacity-70">
-Testing: <code>pytest</code> + <code>pytest-asyncio</code> — 62 tests, full pipeline in MOCK mode with no keys, no internet and no Neo4j.
+Testing: <code>pytest</code> + <code>pytest-asyncio</code> — 81 tests, full pipeline in MOCK mode with no keys, no internet and no Neo4j.
 </div>
 
 <!--
-Note what is *not* here: no LangChain agents, no vendor SDK for the model, no
-embedding API, no scraping framework. The openai package is used purely as a
-protocol client.
-
-That is what makes the provider a two-env-var decision — Mistral, Gemini,
-Groq, DeepSeek, OpenRouter, OpenAI or a local Ollama, with no code change.
+That openai line is what makes the provider a two-env-var decision — Mistral,
+Gemini, Groq, DeepSeek, OpenRouter, OpenAI or a local Ollama, with no code
+change. It is a protocol client, not a vendor SDK.
 -->
 
 ---
 layout: default
 class: dense
+zoom: 0.86
 ---
 
 # Orchestration — the LangGraph shape
@@ -653,6 +674,7 @@ It is normally graph_writer, because Graphiti runs its own extraction per fact.
 
 ---
 layout: default
+zoom: 0.78
 ---
 
 # State — two kinds of channel, and why it matters
@@ -722,6 +744,7 @@ brief. The fix is a state channel, not a try/except.
 
 ---
 layout: default
+zoom: 0.9
 ---
 
 # Idempotency under retry — every node filters
@@ -782,6 +805,7 @@ One slide each — responsibility, degradation, and the decision behind it
 
 ---
 layout: default
+zoom: 0.88
 ---
 
 # Agent 1 · Planner <span class="text-sm opacity-60">`agents/planner.py`</span>
@@ -845,6 +869,7 @@ because policy might never have been in scope.
 ---
 layout: default
 class: dense
+zoom: 0.75
 ---
 
 # Agent 2 · Query Generation <span class="text-sm opacity-60">`agents/query_gen.py`</span>
@@ -920,6 +945,7 @@ the searches were generic rather than planned.
 
 ---
 layout: default
+zoom: 0.73
 ---
 
 # Agent 3 · Search / Discovery <span class="text-sm opacity-60">`agents/search_agent.py`</span>
@@ -1028,6 +1054,21 @@ first consume one of the few slots a dimension is allowed.
 </div>
 
 </div>
+</div>
+
+<!--
+The mechanism is the easy half, and there are only two judgements in it.
+Denylist wins over allowlist, because that is the only reading that cannot be
+used to smuggle a blocked source in. And the match is on a dot boundary, which
+is the difference between a suffix rule and a security hole.
+-->
+
+---
+layout: default
+---
+
+# Source domain policy <span class="text-sm opacity-60">— the judgement, not the mechanism</span>
+
 <div class="text-sm">
 
 ### Denylist — on by default
@@ -1064,20 +1105,19 @@ not the run degrading, and it does not belong in a brief a stakeholder reads.
 </div>
 
 </div>
-</div>
 
 <!--
-This is the "can we crawl fewer sites" question answered properly. The
-mechanism is easy; the judgement is where the content is.
+This is the "can we crawl fewer sites" question answered properly.
 
-Two judgements to defend. First, denylist wins over allowlist, because that is
-the only reading that cannot be used to smuggle a blocked source in. Second,
-the mandatory disclosure: every gap in the brief is reported as "not
-established", and a narrowed search changes what that sentence means.
+The judgement to defend is the mandatory disclosure. Every gap in the brief is
+reported as "not established", and narrowing the search changes what that
+sentence means — so a restricted run has to say so, or the brief overstates
+what it looked for.
 -->
 
 ---
 layout: default
+zoom: 0.7
 ---
 
 # Agent 4 · Official Data <span class="text-sm opacity-60">`agents/official_data_agent.py`</span>
@@ -1153,6 +1193,7 @@ some series carry projections that must never be reported as observed facts.
 ---
 layout: default
 class: dense
+zoom: 0.83
 ---
 
 # Agent 5 · Crawlability Gate <span class="text-sm opacity-60">`agents/crawlability_agent.py`</span>
@@ -1227,6 +1268,7 @@ has no timeout parameter at all, and a black-holed government host is not rare.
 
 ---
 layout: default
+zoom: 0.81
 ---
 
 # Why the gate is structural, not a branch
@@ -1295,6 +1337,7 @@ wasted request and is honoured anyway, because the instruction is about
 
 ---
 layout: default
+zoom: 0.68
 ---
 
 # Agent 6 · Extraction <span class="text-sm opacity-60">`agents/extraction_agent.py`</span>
@@ -1373,6 +1416,7 @@ source entirely, the other loses only the claims.
 
 ---
 layout: default
+zoom: 0.84
 ---
 
 # Content-type gating — a bug worth showing
@@ -1441,6 +1485,7 @@ csv-and-javascript hole nobody had noticed.
 
 ---
 layout: default
+zoom: 0.83
 ---
 
 # Agent 7 · Fact-Checking — independence <span class="text-sm opacity-60">`agents/fact_check_agent.py`</span>
@@ -1512,6 +1557,7 @@ because it is free — identical token cost, strictly better evidence.
 
 ---
 layout: default
+zoom: 0.7
 ---
 
 # Fact-Checking — the trust rules, and batching
@@ -1589,6 +1635,7 @@ cover it.
 
 ---
 layout: default
+zoom: 0.68
 ---
 
 # Agent 8 · Persistence <span class="text-sm opacity-60">`agents/graph_writer_agent.py`</span>
@@ -1665,6 +1712,7 @@ reported at the scope it actually applies to.
 
 ---
 layout: default
+zoom: 0.77
 ---
 
 # Agent 9 · Coverage Evaluator <span class="text-sm opacity-60">`agents/coverage_evaluator.py`</span>
@@ -1734,6 +1782,7 @@ the Lead to go and ask the department directly.
 ---
 layout: default
 class: dense
+zoom: 0.79
 ---
 
 # Agent 10 · Report <span class="text-sm opacity-60">`agents/report_agent.py`</span>
@@ -1805,6 +1854,7 @@ Non-negotiable #6 — *"be ready to justify what lives where"*
 
 ---
 layout: default
+zoom: 0.67
 ---
 
 # Store 1 · SQLite / SQLAlchemy — governance <span class="text-sm opacity-60">`stores/relational_store.py`</span>
@@ -1875,6 +1925,7 @@ the schema is ready, the workflow is not, and the deck says so.
 
 ---
 layout: default
+zoom: 0.65
 ---
 
 # Store 2 · Milvus — semantic recall <span class="text-sm opacity-60">`stores/vector_store.py`</span>
@@ -1947,6 +1998,7 @@ derived and which are authoritative is what makes the difference.
 
 ---
 layout: default
+zoom: 0.7
 ---
 
 # Store 3 · Neo4j + Graphiti — memory over time <span class="text-sm opacity-60">`stores/graph_store.py`</span>
@@ -2020,6 +2072,7 @@ That is why SEMAPHORE_LIMIT is pinned; it defaults to 20 concurrent calls.
 
 ---
 layout: default
+zoom: 0.77
 ---
 
 # Local embeddings — one decision, three consequences <span class="text-sm opacity-60">`llm/embeddings.py`</span>
@@ -2030,8 +2083,8 @@ layout: default
 ```python
 @lru_cache(maxsize=1)
 def get_model():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(settings.EMBEDDING_MODEL)
+    from fastembed import TextEmbedding
+    return TextEmbedding(model_name=_model_name())
 ```
 
 Graphiti normally wants an OpenAI key for **three** separate things: chat, embeddings **and**
@@ -2041,7 +2094,7 @@ reranking. Here only **chat** is remote:
 
 | Graphiti needs | We supply |
 |---|---|
-| `EmbedderClient` | `LocalEmbedder` over sentence-transformers |
+| `EmbedderClient` | `LocalEmbedder` over fastembed/ONNX |
 | `CrossEncoderClient` | `LocalReranker` — cosine over the same bi-encoder |
 | chat | any OpenAI-compatible endpoint |
 
@@ -2090,6 +2143,7 @@ hypothetical — DeepSeek and Groq genuinely have no embeddings route.
 
 ---
 layout: default
+zoom: 0.65
 ---
 
 # The LLM layer — provider by endpoint, not by vendor <span class="text-sm opacity-60">`llm/client.py`</span>
@@ -2159,6 +2213,7 @@ transient failures are exhausted first. Otherwise "safe" silently becomes
 
 ---
 layout: default
+zoom: 0.8
 ---
 
 # Tolerant JSON parsing <span class="text-sm opacity-60">`llm/json_utils.py`</span>
@@ -2281,6 +2336,7 @@ before the worker thread ever started.
 
 ---
 layout: default
+zoom: 0.65
 ---
 
 # Cost and latency budget — every knob bounds a multiplier
@@ -2350,6 +2406,7 @@ for from my own call sites.
 ---
 layout: default
 class: dense
+zoom: 0.93
 ---
 
 # Graceful degradation — failure reported at the right scope
@@ -2397,10 +2454,83 @@ the user reads.
 
 ---
 layout: default
-class: dense
+zoom: 0.72
 ---
 
-# Testing — 62 tests, no keys, no internet, no Neo4j
+# Observability — one run is one trace <span class="text-sm opacity-60">`app/telemetry.py`</span>
+
+<div class="grid grid-cols-2 gap-5">
+<div class="text-sm">
+
+A city is **150–250 model calls** across ten nodes and three datastores. When
+a brief comes back thin, the question is always *which part gave up*.
+
+The pipeline already measured itself — per-node timings, per-model tokens —
+but only **after** the run, only in-process, and only if you went looking.
+
+### What is instrumented
+| Layer | Span |
+|---|---|
+| the run | `research {city}` |
+| each node | `node.{name}` |
+| each model call | `chat {model}` + GenAI attrs |
+| embeddings | `embeddings.encode` |
+| the two stores | `milvus.*`, `graphiti.*` |
+| HTTP, SQL | auto-instrumentation |
+
+</div>
+<div>
+
+```
+research Springfield          151 ms
+  node.planner                  0.1
+  node.query_gen                0.7
+    chat mistral-small-latest   0.4
+  node.extraction               3.9
+    chat … x10
+  node.fact_check               4.5
+    chat … x12
+  node.graph_writer           115.4  ← 76%
+  node.report                   8.2
+```
+
+<div class="text-xs opacity-70 pt-1">
+That arrow is the point. "graph_writer is slow because Graphiti re-extracts entities per fact" stops
+being a claim and becomes a measurement.
+</div>
+
+<div class="p-2 rounded bg-amber-50 dark:bg-amber-900/20 text-xs mt-2">
+
+**Off by default** (`OTEL_ENABLED`). Exports OTLP, so Jaeger, Tempo, **Opik** or
+**Langfuse** are a config change. Prompts are **not** recorded unless asked —
+they hold scraped page text.
+
+</div>
+
+</div>
+</div>
+
+<!--
+Two things I would raise myself here.
+
+The root span lives in app/jobs.py, not the request handler — the handler
+returns a job id in milliseconds while the run takes minutes, so a trace
+started there would end before the work began.
+
+And the bug the tests caught: trace context is a contextvar, so asyncio tasks
+inherit it but threads do not. Four stages fan out across thread pools, so
+every model call inside one was starting its own root trace — about 150
+orphans per city. The test that asserts "a run is exactly one trace" is what
+found it.
+-->
+
+---
+layout: default
+class: dense
+zoom: 0.77
+---
+
+# Testing — 81 tests, no keys, no internet, no Neo4j
 
 <div class="grid grid-cols-2 gap-5 text-sm">
 <div>
@@ -2469,6 +2599,7 @@ misleading.
 
 ---
 layout: default
+zoom: 0.65
 ---
 
 # Deployment
@@ -2545,6 +2676,7 @@ a proxy that must be manually kept in sync with the thing it proxies.
 ---
 layout: default
 class: dense
+zoom: 0.88
 ---
 
 # What I cut, and what I would do next

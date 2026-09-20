@@ -34,6 +34,24 @@ def domain_of(url: str) -> str:
     return netloc[4:] if netloc.startswith("www.") else netloc
 
 
+def domain_matches(domain: str, patterns) -> bool:
+    """Whether `domain` is, or sits under, any of `patterns`.
+
+    Suffix matching on a dot boundary, so `gov.in` covers
+    `nhm.maharashtra.gov.in` while `notgov.in` matches neither. The dot
+    matters: a plain `endswith` would let `evilgov.in` pass as `gov.in`,
+    which for an allowlist is the difference between a policy and a
+    suggestion.
+    """
+    domain = (domain or "").lower().strip().lstrip(".")
+    if not domain:
+        return False
+    return any(
+        domain == pattern or domain.endswith(f".{pattern}")
+        for pattern in patterns
+    )
+
+
 def tokens(text: str) -> set[str]:
     """Words of four characters or more, lowercased. Long enough to skip the
     stopwords that would otherwise dominate an overlap score."""

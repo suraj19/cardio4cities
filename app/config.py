@@ -5,7 +5,7 @@ touching os.environ directly, so MOCK vs LIVE is a single switch.
 The LLM is configured by endpoint rather than by vendor: anything that
 speaks the OpenAI chat-completions protocol works (Mistral by default,
 or Gemini, DeepSeek, Groq, OpenRouter, OpenAI, a local Ollama). Embeddings are
-generated locally by sentence-transformers, so the provider only has to serve
+generated locally by fastembed/ONNX, so the provider only has to serve
 chat completions — see app/llm/embeddings.py for why that matters.
 
 Provider choice is a throughput decision, not a quality one. See LLM_MODEL
@@ -14,10 +14,24 @@ single city costs 150-250 calls.
 """
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Hosts that mean "a model server on this machine". Ollama, LM Studio and
+# llama.cpp all ignore the Authorization header entirely, so requiring an API
+# key for them turns a correct configuration into a startup error telling the
+# operator to go and obtain a key that does not exist.
+_LOCAL_HOSTS = frozenset(
+    {"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"}
+)
+
+
+def _is_local_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in _LOCAL_HOSTS or host.endswith(".local")
 
 # SQLite and Milvus Lite both write here, and neither creates the directory
 # itself — without this the first run dies on "unable to open database file".
@@ -32,6 +46,15 @@ def _env(name: str, *fallbacks: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def _csv_env(name: str, default: str = "") -> tuple[str, ...]:
+    """A comma-separated setting as a lowercased tuple, blanks discarded."""
+    return tuple(
+        item.strip().lower().lstrip(".")
+        for item in _env(name, default=default).split(",")
+        if item.strip()
+    )
 
 
 def _int_env(name: str, default: int) -> int:
@@ -75,8 +98,9 @@ class Settings:
     # not by how generous it sounds:
     #
     #   Per day      a wall. The run stops unfinished and waits 24h.
-    #                gemini-3.5-flash   20 req/day  -> cannot finish one pass
-    #                groq llama-3.3-70b 100k tok/day -> dies about a fifth in
+    #                gemini-3.5-flash    20 req/day  -> cannot finish one pass
+    #                groq openai/gpt-oss 200k tok/day -> about half a city, and
+    #                its 8k TPM throttles the half it does allow to ~50 min
     #   Per month    a budget. 400-600k against Mistral's 1B/month is noise.
     #   Per second   a throttle. The run takes longer and still finishes,
     #                which is the only one of the three a batch job absorbs.
@@ -99,19 +123,24 @@ class Settings:
     # narrative and /ask. Perhaps 30 calls per run, and every one of them is a
     # decision a reader would notice getting wrong.
     #
-    # Medium 3.5 rather than Large 3 because Large is NOT served on the free
-    # tier: it is absent from GET /v1/models for a free key and returns
-    # 403 'tier_not_allowed' (code 1910) if you ask for it anyway. Medium is
-    # listed for the same key, so it is the best judgement model a no-bill
-    # account can reach.
+    # Small 4 here — the same model the bulk profile uses — because it is the
+    # only OPEN-WEIGHT model Mistral serves: Apache 2.0, weights published, so
+    # the whole pipeline can be inspected, self-hosted or audited by whoever
+    # reads the brief. Medium and Large are both stronger and both closed.
     #
-    # ON A PAID KEY, SWITCH THIS TO mistral-large-latest. Large 3 is both
-    # stronger and ~3x cheaper than Medium 3.5 — $0.50/$1.50 per 1M tokens
-    # against $1.50/$7.50 — so the free-tier default is the expensive one if
-    # you ever start paying. Mistral's generation numbers do not order the
-    # way the names imply, which is why this is worth checking rather than
-    # assuming.
-    LLM_MODEL: str = _env("LLM_MODEL", default="mistral-medium-latest")
+    # The judgement/bulk distinction is NOT lost by sharing a model. It moves
+    # to the thinking budget below: high for the ~30 decisions a reader would
+    # notice getting wrong, none for the ~120 calls that fill a fixed schema.
+    # One model, two efforts.
+    #
+    # ON A PAID KEY, mistral-large-latest is the upgrade, and it is also ~3x
+    # CHEAPER than Medium 3.5 — $0.50/$1.50 per 1M tokens against $1.50/$7.50.
+    # Mistral's generation numbers do not order the way the names imply, which
+    # is why this is worth checking rather than assuming. Large is absent from
+    # GET /v1/models for a free key and returns 403 'tier_not_allowed' (1910),
+    # and it does NOT implement reasoning_effort — so switching to it means
+    # blanking LLM_REASONING_EFFORT in the same change.
+    LLM_MODEL: str = _env("LLM_MODEL", default="mistral-small-latest")
 
     # The workhorse: claim extraction and Graphiti's entity extraction. Perhaps
     # 120 of the run's 150-250 calls, and not one of them is a judgement — they
@@ -136,26 +165,42 @@ class Settings:
     # thinking tokens are billed at the OUTPUT rate and counted against the
     # same budget as the answer.
     #
-    # The two defaults differ because the two models differ, not because the
-    # roles do. Mistral Small 4 is a hybrid instruct/reasoning model and
-    # implements the parameter; Mistral Large 3 does not, and an
-    # OpenAI-compatible shim REJECTS a parameter it does not implement rather
-    # than ignoring it — so a value here would fail every judgement call with
-    # an opaque 400. Empty means "send no such field", which is the only safe
-    # default for a model that has no opinion about it.
+    # Now that both profiles run Mistral Small 4, these two values are what
+    # separates a judgement call from a bulk one. Small 4 is a hybrid
+    # instruct/reasoning model and implements only two settings: "high" and
+    # "none". "none" is a value Mistral defines rather than an absence — answer
+    # directly, no thinking trace — which is exactly right for filling a fixed
+    # schema, and it is where most of the token saving on a run comes from.
     #
-    # "none" is a value Mistral defines, not an absence: it means answer
-    # directly with no thinking trace, which is exactly right for filling a
-    # fixed schema. Do NOT set "high" here without reading app/llm/client.py
-    # first — on Small 4 it makes `message.content` a list of chunks instead
-    # of a string, and every caller in this codebase parses a string.
+    # "high" is safe here, though it was not always: on Small 4 it returns
+    # `message.content` as a list of thinking/text chunks instead of a string,
+    # and every caller in this codebase parses a string. `_answer_text` in
+    # app/llm/client.py unwraps that and drops the trace. If you remove it,
+    # this default has to go back to empty.
+    #
+    # Blank means "send no such field", which is the only safe value for a
+    # model that does not implement the parameter: an OpenAI-compatible shim
+    # REJECTS a parameter it does not know rather than ignoring it, so a value
+    # aimed at the wrong model fails every call with an opaque 400.
     #
     # `scripts/check_services.py` calls both profiles and names the effort it
     # sent, so a rejected value shows up in preflight rather than as an empty
     # graph three minutes into a run.
-    LLM_REASONING_EFFORT: str = _env("LLM_REASONING_EFFORT", default="")
+    #
+    # Both default to blank against a LOCAL endpoint, the same way MILVUS_URI
+    # alone decides Lite-or-cluster. Ollama does accept the field, but on a
+    # local server the trade the split encodes no longer exists: thinking is
+    # billed in wall-clock rather than money, and an 8B model asked to
+    # deliberate spends minutes per call to reach the same JSON. LM Studio and
+    # llama.cpp are also reached this way and do not all implement it. Set
+    # either explicitly to override.
+    LLM_REASONING_EFFORT: str = _env(
+        "LLM_REASONING_EFFORT",
+        default="" if _is_local_url(LLM_BASE_URL) else "high",
+    )
     LLM_BULK_REASONING_EFFORT: str = _env(
-        "LLM_BULK_REASONING_EFFORT", default="none"
+        "LLM_BULK_REASONING_EFFORT",
+        default="" if _is_local_url(LLM_BASE_URL) else "none",
     )
 
     # Output ceilings. These bound thinking tokens too, so they cannot be cut
@@ -229,6 +274,31 @@ class Settings:
     # "what did you cut when time was limited" answer in the report.
     QUERIES_PER_DIMENSION: int = _int_env("QUERIES_PER_DIMENSION", 2)
     MAX_SOURCES_PER_DIMENSION: int = _int_env("MAX_SOURCES_PER_DIMENSION", 4)
+
+    # --- Source domain policy -----------------------------------------
+    # Applied in search_agent, *before* the per-dimension cap above, so a
+    # result that was never going to be usable cannot first consume one of the
+    # few source slots a dimension is allowed.
+    #
+    # The denylist is an editorial rule rather than a performance one. A
+    # user-generated video or a social post is not citable evidence in a
+    # public-health brief no matter how relevant a search engine finds it, so
+    # fetching one only spends a model call to discover it says nothing.
+    SOURCE_DOMAIN_DENYLIST: tuple[str, ...] = _csv_env(
+        "SOURCE_DOMAIN_DENYLIST",
+        default=(
+            "youtube.com,youtu.be,facebook.com,instagram.com,twitter.com,"
+            "x.com,tiktok.com,pinterest.com,reddit.com,quora.com,"
+            "linkedin.com,tripadvisor.com,amazon.com"
+        ),
+    )
+    # Empty by default, meaning discovery stays open — most of the value of
+    # the brief is in sources nobody thought to nominate, and a curated list
+    # cannot surprise you. Set it to pin a demo to known-good domains, which
+    # is faster and repeatable; the run then *discloses* the restriction in
+    # the report, because gaps produced by a narrowed search would otherwise
+    # read as an absence of published information.
+    SOURCE_DOMAIN_ALLOWLIST: tuple[str, ...] = _csv_env("SOURCE_DOMAIN_ALLOWLIST")
     MAX_CLAIMS_PER_PASSAGE: int = _int_env("MAX_CLAIMS_PER_PASSAGE", 3)
     # How many rival passages the fact-checker sees per claim, and how much of
     # each. Corroboration needs the most relevant few, not all of them.
@@ -328,17 +398,97 @@ class Settings:
     # and not the deliverable.
     JOB_RETENTION_SECONDS: int = _int_env("JOB_RETENTION_SECONDS", 3600)
 
-    # Load the embedding model at startup instead of on the first request.
-    # ~60s of model load otherwise lands on whoever asks first, which during a
-    # demo is indistinguishable from the app having hung — and on a platform
-    # with an HTTP deadline it can consume the entire request budget.
+    # Load the embedding model at startup instead of on the first request, so
+    # the ~60s model load does not land on whoever asks first — during a demo
+    # that is indistinguishable from the app having hung.
+    #
+    # OFF by default, because the cost of being wrong is asymmetric. Turning it
+    # on allocates the embedding model in the first seconds of every container
+    # start, and on a memory-capped host that spike can be an OOM kill
+    # rather than an exception: the prewarm helper catches everything it can,
+    # but a process killed by the kernel cannot log. Deferring the load costs
+    # one slow request; doing it at boot can cost the deployment. Turn it on
+    # once the host is known to have headroom (see docs/DEPLOYMENT.md).
     PREWARM_EMBEDDINGS: bool = _env(
-        "PREWARM_EMBEDDINGS", default="true"
+        "PREWARM_EMBEDDINGS", default="false"
     ).strip().lower() not in ("0", "false", "no", "off")
+
+    # --- Observability -------------------------------------------------
+    # OFF by default, for the same reason PREWARM_EMBEDDINGS is: this has to
+    # keep fitting a 0.5 GB container, and an exporter that cannot reach its
+    # collector should never be something a research run waits on. Turning it
+    # on with no OpenTelemetry installed logs once and continues without it.
+    #
+    # Everything below is deliberately thin. The endpoint and headers are
+    # configured with the SDK's OWN standard variables
+    # (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS) wherever
+    # possible, so anyone who has configured an OTel SDK before already knows
+    # how to point this one; OTEL_EXPORTER_ENDPOINT here is only an override.
+    OTEL_ENABLED: bool = _env("OTEL_ENABLED", default="false").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    )
+    OTEL_SERVICE_NAME: str = _env("OTEL_SERVICE_NAME", default="cardio4cities")
+    OTEL_SERVICE_VERSION: str = _env("OTEL_SERVICE_VERSION", default="0.1.0")
+    OTEL_EXPORTER_ENDPOINT: str = _env(
+        "OTEL_EXPORTER_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"
+    )
+    # Prints spans to stdout instead of shipping them. The difference between
+    # telemetry you can try in one command and telemetry you have to deploy a
+    # collector for.
+    OTEL_CONSOLE_EXPORT: bool = _env(
+        "OTEL_CONSOLE_EXPORT", default="false"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+    OTEL_METRICS_ENABLED: bool = _env(
+        "OTEL_METRICS_ENABLED", default="true"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+    # Escape hatch for a backend that takes traces and metrics on different
+    # endpoints — and the override that re-enables metrics when the shared
+    # endpoint is a traces-only one like Opik's.
+    OTEL_METRICS_ENDPOINT: str = _env(
+        "OTEL_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+    )
+    # Record prompts and completions on LLM spans. OFF by default, and the
+    # default is the careful one on purpose: prompts here contain scraped
+    # third-party page content, and a trace backend is a copy of it that
+    # nobody audits.
+    #
+    # Turn it on for an LLM-native dashboard — Opik, Langfuse, LangSmith —
+    # where the prompt/completion pair IS the product. With it off, those
+    # tools still draw the correct trace tree with timings and token counts,
+    # but every span detail panel is empty, which reads as a broken
+    # integration rather than a deliberate one.
+    OTEL_CAPTURE_CONTENT: bool = _env(
+        "OTEL_CAPTURE_CONTENT", default="false"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+    # Ceiling per recorded field, since a page body can be tens of KB and
+    # every backend drops or truncates oversized attributes anyway.
+    OTEL_CAPTURE_CONTENT_CHARS: int = int(
+        _env("OTEL_CAPTURE_CONTENT_CHARS", default="4000")
+    )
 
     @property
     def is_mock(self) -> bool:
         return self.RUN_MODE == "MOCK"
+
+    @property
+    def llm_is_local(self) -> bool:
+        """Whether LLM_BASE_URL points at a model server on this machine.
+
+        Ollama, LM Studio and llama.cpp ignore the Authorization header
+        entirely — Ollama's own documentation describes the api_key as
+        "required but ignored". Demanding LLM_API_KEY for them turns a correct
+        configuration into a startup error telling the operator to obtain a key
+        that does not exist, which is a worse outcome than the missing-key case
+        the check was written for.
+
+        Read as a property rather than frozen at import so a test that patches
+        LLM_BASE_URL sees the change.
+        """
+        return _is_local_url(self.LLM_BASE_URL)
 
 
 settings = Settings()
